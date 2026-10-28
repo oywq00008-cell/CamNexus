@@ -15,6 +15,8 @@ Any device that exposes an **RTSP address** can be added — IP cameras, NVRs, e
 
 The goal is simple: **turn an old PC into a surveillance recorder**. That's why it records the original stream without re-encoding, renders with a lightweight UI, and keeps memory in the low hundreds of megabytes.
 
+![CamNexus main window](assets/screenshot.png)
+
 ---
 
 ## Features
@@ -149,6 +151,20 @@ Files are organised as `channel / date / time`, and can be opened with any media
 
 ---
 
+## Companion app
+
+### CamNexusRTSP — turn an Android phone into a camera
+
+Got a spare Android phone? Install [CamNexusRTSP](https://github.com/oywq00008-cell/CamNexus-RTSP): it runs an RTSP server on the phone itself and streams the camera straight onto your LAN — no PC relay, no cloud.
+
+- A phone camera usually looks far better than a budget IP camera
+- Standard RTSP output, so you can add it here as a channel directly
+- Keeps streaming in the background and while locked; optional credentials; port 8554 by default
+
+> To connect: start streaming on the phone, then paste the `rtsp://phone-ip:8554/...` address shown there into **Settings → Channels**.
+
+---
+
 ## FAQ
 
 **A camera won't connect.**
@@ -165,7 +181,7 @@ By default the camera's own bitstream is stored. To save space, lower the bitrat
 
 **Which cameras are supported?**
 
-Any device with a standard RTSP URL. Hikvision, Dahua, Uniview, TP-LINK and similar brands work; a phone running an RTSP camera app works too.
+Any device with a standard RTSP URL. Hikvision, Dahua, Uniview, TP-LINK and similar brands work; on Android you can use [CamNexusRTSP](https://github.com/oywq00008-cell/CamNexus-RTSP) to serve the phone camera as a stream.
 
 **Does it need internet access?**
 
