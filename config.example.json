@@ -1,0 +1,67 @@
+{
+  "channels": [
+    {
+      "name": "示例 摄像机 1",
+      "url": "rtsp://192.168.1.10:554/Streaming/Channels/101",
+      "sub_url": "",
+      "username": "admin",
+      "password": "在此填写密码",
+      "enabled": true,
+      "record": {
+        "width": 960,
+        "height": 540,
+        "audio": true,
+        "copy": false,
+        "codec": "h265",
+        "quality": "balanced"
+      },
+      "rotate": 0,
+      "flip_h": false,
+      "flip_v": false,
+      "aspect_lock": true,
+      "crop_borders": false
+    },
+    {
+      "name": "示例 摄像机 2",
+      "url": "rtsp://192.168.1.11:554/live/ch00_0",
+      "sub_url": "",
+      "username": "admin",
+      "password": "在此填写密码",
+      "enabled": false,
+      "record": {
+        "width": 960,
+        "height": 540,
+        "audio": true,
+        "copy": false,
+        "codec": "h265",
+        "quality": "balanced"
+      },
+      "rotate": 0,
+      "flip_h": false,
+      "flip_v": false,
+      "aspect_lock": true,
+      "crop_borders": false
+    }
+  ],
+  "ffmpeg_path": "",
+  "render_width": 960,
+  "render_height": 540,
+  "fps": 0,
+  "tcp": true,
+  "dark": true,
+  "hwdec": "none",
+  "show_hints": true,
+  "volume": 1.5,
+  "onboarding": "done",
+  "record_dir": "",
+  "record_max_mb": 512000,
+  "detect": {
+    "device": "cpu",
+    "fps": 1,
+    "night_opt": false,
+    "static_grace_secs": 60,
+    "enabled": false
+  },
+  "lang": "zh",
+  "tiles": []
+}

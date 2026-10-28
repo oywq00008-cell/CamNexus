@@ -1,0 +1,41 @@
+// CamNexus 的 Windows 资源定义：图标 + 版本信息
+//
+// 由 build.rs 调用 Windows SDK 的 rc.exe 编译成 .res，再随 exe 一起链接。
+// 想改公司名、描述、版权，直接改下面的 VALUE 即可，重新 cargo build 生效。
+//
+// 注意：数值版本号（FILEVERSION / ProductVersion）请与 Cargo.toml 的
+// package.version 保持一致，build.rs 会做一致性检查并在不一致时告警。
+
+#pragma code_page(65001)   // 源文件是 UTF-8，中文才不会被按 GBK 解读
+
+1 ICON "assets\\camnexus.ico"
+
+1 VERSIONINFO
+FILEVERSION     0,5,1,0
+PRODUCTVERSION  0,5,1,0
+FILEFLAGSMASK   0x3fL
+FILEFLAGS       0x0L
+FILEOS          0x40004L
+FILETYPE        0x1L
+FILESUBTYPE     0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName",      "oywq0008-cell"
+            VALUE "FileDescription",  "CamNexus 监控中枢 — 局域网 RTSP 摄像统一监看"
+            VALUE "FileVersion",      "0.5.1"
+            VALUE "InternalName",     "camnexus"
+            VALUE "LegalCopyright",   "© 2026 oywq0008-cell"
+            VALUE "OriginalFilename", "camnexus.exe"
+            VALUE "ProductName",      "CamNexus 监控中枢"
+            VALUE "ProductVersion",   "0.5.1"
+            VALUE "Comments",         "支持任意 RTSP 设备统一监看、录像回放与人体/车辆识别"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

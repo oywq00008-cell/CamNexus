@@ -1,0 +1,22 @@
+# 构建产物
+/target
+
+# 绿色发布包（含 ffmpeg.exe 与含凭据的 config.json，不要提交）
+/dist
+/*.zip
+
+# 本机实测产物：截图（含真实监控画面与内网地址）、旧打包件
+/local
+/*.png
+
+# 本地配置（含真实摄像机地址与密码；程序首次运行自动生成）
+/config.json
+/config.local.json
+
+# 日志与临时文件
+*.log
+*.tmp
+.DS_Store
+
+# 用户下载的原始素材目录（已归档到 assets/）
+/喇叭

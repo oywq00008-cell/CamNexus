@@ -1,0 +1,7 @@
+# 仓库内统一存 LF；Windows 检出时由 core.autocrlf 自动转 CRLF
+* text=auto
+
+# 二进制文件不做换行处理
+*.ico binary
+*.png binary
+*.exe binary
