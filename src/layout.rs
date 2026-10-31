@@ -302,52 +302,91 @@ pub fn grid_cells(n: usize, canvas: Rect, gap: f32, target: f32) -> (usize, Vec<
     (cols, out)
 }
 
-/// 在 RGB24 帧里找出「非黑」内容区，返回归一化的 `[x, y, w, h]`。
+/// 判定「黑边」的两个条件，缺一不可。
 ///
-/// 用于裁掉推流端塞进来的纯黑边（手机竖屏塞进 16:9 是最常见的场景）。
-/// 判据：某一行/列里只要有一个采样点大于阈值就算「有内容」。
+/// 只看亮度是不够的：夜景画面本身就接近全黑，很多列的最大亮度只有 9~12，
+/// 按亮度阈值会把画面当成黑边裁掉。真正的黑边还有一个特征——**完全均匀**：
+/// 编码器补的黑边极差恒为 0，而画面再暗也有传感器噪点（实测极差 5~207）。
+const BAR_MAX_VALUE: u8 = 3;
+const BAR_MAX_RANGE: u8 = 3;
+
+/// 黑边左右（或上下）宽度允许的不对称比例。
+/// 超过就说明检测很可能吃进了画面内容，宁可不裁也不要裁错。
+const BAR_MAX_ASYMMETRY: f32 = 0.02;
+
+/// 在 RGB24 帧里找出内容区，返回归一化的 `[x, y, w, h]`。
+///
+/// 用于裁掉推流端塞进来的黑边（手机竖屏塞进 16:9 是最常见的场景）。
+/// 判据：某一列/行**又暗又均匀**才算黑边，其余都算画面。
 ///
 /// 以下情况返回 None（不裁）：
-/// - 整帧全黑（没画面）
+/// - 整帧都是黑边（没画面）
 /// - 内容几乎占满（没有黑边可裁）
 /// - 内容小得离谱（小于 5%，多半是噪点或误判）
-pub fn content_box(data: &[u8], w: usize, h: usize, thresh: u8) -> Option<[f32; 4]> {
+pub fn content_box(data: &[u8], w: usize, h: usize) -> Option<[f32; 4]> {
     if w == 0 || h == 0 || data.len() < w * h * 3 {
         return None;
     }
     // 降采样扫描：1920×1080 全扫是 600 万次，这里压到约 13 万次
     let step_x = (w / 480).max(1);
     let step_y = (h / 270).max(1);
+    let cols = w.div_ceil(step_x);
+    let rows = h.div_ceil(step_y);
 
-    let (mut x0, mut x1, mut y0, mut y1) = (usize::MAX, 0usize, usize::MAX, 0usize);
-    let mut any = false;
+    let mut col_min = vec![255u8; cols];
+    let mut col_max = vec![0u8; cols];
+    let mut row_min = vec![255u8; rows];
+    let mut row_max = vec![0u8; rows];
 
     let mut y = 0;
-    while y < h {
+    let mut ri = 0;
+    while y < h && ri < rows {
         let mut x = 0;
-        while x < w {
+        let mut ci = 0;
+        while x < w && ci < cols {
             let o = (y * w + x) * 3;
-            let m = data[o].max(data[o + 1]).max(data[o + 2]);
-            if m > thresh {
-                any = true;
-                x0 = x0.min(x);
-                x1 = x1.max(x);
-                y0 = y0.min(y);
-                y1 = y1.max(y);
+            let v = data[o].max(data[o + 1]).max(data[o + 2]);
+            if v < col_min[ci] {
+                col_min[ci] = v;
+            }
+            if v > col_max[ci] {
+                col_max[ci] = v;
+            }
+            if v < row_min[ri] {
+                row_min[ri] = v;
+            }
+            if v > row_max[ri] {
+                row_max[ri] = v;
             }
             x += step_x;
+            ci += 1;
         }
         y += step_y;
-    }
-    if !any {
-        return None;
+        ri += 1;
     }
 
-    // 采样点是稀疏的，边界要按步长补回去，再夹到帧内
-    let left = x0;
-    let right = (x1 + step_x).min(w);
-    let top = y0;
-    let bottom = (y1 + step_y).min(h);
+    // 又暗又均匀 = 黑边
+    let is_bar_col = |i: usize| col_max[i] <= BAR_MAX_VALUE && col_max[i] - col_min[i] <= BAR_MAX_RANGE;
+    let is_bar_row = |i: usize| row_max[i] <= BAR_MAX_VALUE && row_max[i] - row_min[i] <= BAR_MAX_RANGE;
+
+    // 整帧全黑时 find 返回 None，直接放弃裁剪
+    let first_c = (0..cols).find(|i| !is_bar_col(*i))?;
+    let last_c = (0..cols).rev().find(|i| !is_bar_col(*i))?;
+    let first_r = (0..rows).find(|i| !is_bar_row(*i))?;
+    let last_r = (0..rows).rev().find(|i| !is_bar_row(*i))?;
+
+    let left = first_c * step_x;
+    let right = ((last_c + 1) * step_x).min(w);
+    let top = first_r * step_y;
+    let bottom = ((last_r + 1) * step_y).min(h);
+
+    // 对称性检查：编码器补的黑边一定左右（上下）等宽。
+    // 不等就说明检测多半已经吃进画面，直接放弃裁剪。
+    let asym_x = (left as f32 - (w - right) as f32).abs() / w as f32;
+    let asym_y = (top as f32 - (h - bottom) as f32).abs() / h as f32;
+    if asym_x > BAR_MAX_ASYMMETRY || asym_y > BAR_MAX_ASYMMETRY {
+        return None;
+    }
 
     let bw = (right - left) as f32 / w as f32;
     let bh = (bottom - top) as f32 / h as f32;
@@ -361,12 +400,7 @@ pub fn content_box(data: &[u8], w: usize, h: usize, thresh: u8) -> Option<[f32; 
         return None;
     }
 
-    Some([
-        left as f32 / w as f32,
-        top as f32 / h as f32,
-        bw,
-        bh,
-    ])
+    Some([left as f32 / w as f32, top as f32 / h as f32, bw, bh])
 }
 
 /// 归一化（0..1，相对画布），用于写进配置
@@ -679,7 +713,7 @@ mod tests {
         // 模拟手机竖屏：1920×1080 里中间 608 宽的竖条
         let (w, h) = (1920, 1080);
         let d = frame_with_box(w, h, 656, 0, 608, h);
-        let b = content_box(&d, w, h, 12).expect("应该检测出内容区");
+        let b = content_box(&d, w, h).expect("应该检测出内容区");
         assert!((b[0] - 656.0 / 1920.0).abs() < 0.01, "左边不对: {}", b[0]);
         assert!((b[2] - 608.0 / 1920.0).abs() < 0.02, "宽度不对: {}", b[2]);
         assert!((b[3] - 1.0).abs() < 0.02, "高度应占满");
@@ -689,7 +723,7 @@ mod tests {
     fn content_box_finds_letterboxed() {
         let (w, h) = (1280, 720);
         let d = frame_with_box(w, h, 0, 90, w, 540);
-        let b = content_box(&d, w, h, 12).expect("应该检测出内容区");
+        let b = content_box(&d, w, h).expect("应该检测出内容区");
         assert!((b[1] - 90.0 / 720.0).abs() < 0.02, "上边不对: {}", b[1]);
         assert!((b[2] - 1.0).abs() < 0.02, "宽度应占满");
     }
@@ -698,14 +732,14 @@ mod tests {
     fn content_box_ignores_full_frame() {
         let (w, h) = (640, 360);
         let d = vec![120u8; w * h * 3];
-        assert!(content_box(&d, w, h, 12).is_none(), "占满时不该裁");
+        assert!(content_box(&d, w, h).is_none(), "占满时不该裁");
     }
 
     #[test]
     fn content_box_ignores_all_black() {
         let (w, h) = (640, 360);
         let d = vec![0u8; w * h * 3];
-        assert!(content_box(&d, w, h, 12).is_none(), "全黑时不该裁");
+        assert!(content_box(&d, w, h).is_none(), "全黑时不该裁");
     }
 
     #[test]
@@ -713,13 +747,59 @@ mod tests {
         let (w, h) = (1920, 1080);
         // 一个 3×3 的亮点，占不到 5%
         let d = frame_with_box(w, h, 900, 500, 3, 3);
-        assert!(content_box(&d, w, h, 12).is_none(), "噪点不该触发裁剪");
+        assert!(content_box(&d, w, h).is_none(), "噪点不该触发裁剪");
+    }
+
+
+    #[test]
+    fn content_box_handles_night_scene() {
+        // 夜景：画面本身接近全黑，只有零星亮窗。
+        // 旧判据（够亮才算画面）会把暗部当黑边裁掉；新判据看「是否均匀」。
+        let (w, h) = (1600, 900);
+        let mut d = vec![0u8; w * h * 3];
+        // 内容区 x 500..1100：整体亮度 6，另有几个亮点
+        for y in 0..h {
+            for x in 500..1100 {
+                let o = (y * w + x) * 3;
+                d[o] = 6;
+                d[o + 1] = 6;
+                d[o + 2] = 6;
+            }
+        }
+        for (x, y) in [(700, 300), (800, 500), (900, 700)] {
+            let o = (y * w + x) * 3;
+            d[o] = 200;
+            d[o + 1] = 200;
+            d[o + 2] = 200;
+        }
+        let b = content_box(&d, w, h).expect("夜景也应该能找出内容区");
+        assert!((b[0] - 500.0 / 1600.0).abs() < 0.01, "左边不对: {}", b[0]);
+        assert!((b[2] - 600.0 / 1600.0).abs() < 0.02, "宽度不对: {}", b[2]);
+    }
+
+    #[test]
+    fn content_box_tolerates_slightly_noisy_bars() {
+        // 黑边可能带极轻微噪声（编码振铃），只要不超范围仍应判为黑边
+        let (w, h) = (1600, 900);
+        let mut d = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..500 {
+                let o = (y * w + x) * 3;
+                d[o] = (x % 4) as u8; // 0..3 的抖动
+            }
+            for x in 500..1100 {
+                let o = (y * w + x) * 3;
+                d[o] = 180;
+            }
+        }
+        let b = content_box(&d, w, h).expect("应找出内容区");
+        assert!((b[0] - 500.0 / 1600.0).abs() < 0.01, "抖动黑边没被忽略: {}", b[0]);
     }
 
     #[test]
     fn content_box_handles_short_buffer() {
         let d = vec![255u8; 10]; // 数据不够一帧
-        assert!(content_box(&d, 640, 360, 12).is_none());
+        assert!(content_box(&d, 640, 360).is_none());
     }
 
     #[test]

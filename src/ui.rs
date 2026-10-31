@@ -3820,7 +3820,7 @@ impl eframe::App for CamNexusApp {
             w.next = Some(now + Duration::from_secs(2));
 
             let Some(f) = frame else { continue };
-            let found = layout::content_box(&f.data, f.w, f.h, 12);
+            let found = layout::content_box(&f.data, f.w, f.h);
             match (&w.pending, found) {
                 (Some(p), Some(d)) if {
                     // 和上一次检测足够接近才算稳定
