@@ -2260,10 +2260,13 @@ impl CamNexusApp {
                 self.icons.muted.id()
             };
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+            // 喇叭图标视觉上偏上，下沉 1px 与录像图标对齐；
+            // 只动绘制位置，命中区仍是 icon_rect
+            let draw = icon_rect.translate(egui::vec2(0.0, 1.0));
             // 阴影提升亮场景下的可读性
             p.image(
                 tex,
-                icon_rect.translate(egui::vec2(1.0, 1.0)),
+                draw.translate(egui::vec2(1.0, 1.0)),
                 uv,
                 egui::Color32::from_black_alpha(150),
             );
@@ -2272,7 +2275,7 @@ impl CamNexusApp {
             } else {
                 egui::Color32::from_white_alpha(200)
             };
-            p.image(tex, icon_rect, uv, tint);
+            p.image(tex, draw, uv, tint);
         }
         let tip = if audible {
             tr("停止播放这一路的声音")
