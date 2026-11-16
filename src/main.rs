@@ -62,6 +62,18 @@ fn main() -> eframe::Result<()> {
         }
     }
     let open_diag = args.iter().any(|a| a == "--diag");
+    // --screenshot <路径> [--screenshot-delay 秒]：延时截一张图后退出
+    let shot_path = args
+        .iter()
+        .position(|a| a == "--screenshot")
+        .and_then(|i| args.get(i + 1))
+        .map(std::path::PathBuf::from);
+    let shot_delay = args
+        .iter()
+        .position(|a| a == "--screenshot-delay")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(12);
     // --detect-test <图片>：用 ffmpeg 解码后跑一次检测，打印结果（自检用）
     // --net-test：打印各网卡 2 秒内的收发速率，用于核对数据栏的读数
     if args.iter().any(|a| a == "--net-test") {
@@ -173,6 +185,9 @@ fn main() -> eframe::Result<()> {
             }
             if let Some(n) = audio_start {
                 app.start_audio_index(n.saturating_sub(1));
+            }
+            if let Some(p) = shot_path.clone() {
+                app.schedule_screenshot(p, std::time::Duration::from_secs(shot_delay));
             }
             Ok(Box::new(app))
         }),
