@@ -27,6 +27,21 @@ const ERR: egui::Color32 = egui::Color32::from_rgb(255, 107, 107);
 /// 叠在视频上的文字统一用浅色，与主题无关
 const CHIP_TEXT: egui::Color32 = egui::Color32::from_rgb(240, 244, 250);
 
+/// 右下角全屏按钮的尺寸与边距（画面块要让位给它）
+const FS_BTN_SIZE: f32 = 34.0;
+const FS_BTN_MARGIN: f32 = 10.0;
+
+/// 全屏按钮在画布上的确切位置
+fn fs_btn_rect(area: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(
+            area.right() - FS_BTN_SIZE - FS_BTN_MARGIN,
+            area.bottom() - FS_BTN_SIZE - FS_BTN_MARGIN,
+        ),
+        egui::vec2(FS_BTN_SIZE, FS_BTN_SIZE),
+    )
+}
+
 /// 主题调色板：所有界面颜色都从这里取，避免出现「浅色控件 + 深色外壳」
 #[derive(Clone, Copy)]
 pub struct Pal {
@@ -37,26 +52,38 @@ pub struct Pal {
     pub muted: egui::Color32,
     pub warn_bg: egui::Color32,
     pub window: egui::Color32,
+    /// 卡片里的次级面（输入框、分组底）
+    pub surface: egui::Color32,
+    /// 1px 描边：替代阴影划分层次
+    pub stroke: egui::Color32,
+    /// 悬浮态背景
+    pub hover: egui::Color32,
 }
 
 pub const PAL_DARK: Pal = Pal {
-    bg: egui::Color32::from_rgb(12, 15, 20),
-    panel: egui::Color32::from_rgb(20, 25, 33),
-    card: egui::Color32::from_rgb(16, 20, 27),
-    text: egui::Color32::from_rgb(230, 235, 244),
-    muted: egui::Color32::from_rgb(138, 148, 165),
-    warn_bg: egui::Color32::from_rgb(52, 42, 20),
-    window: egui::Color32::from_rgb(22, 27, 35),
+    bg: egui::Color32::from_rgb(9, 11, 15),
+    panel: egui::Color32::from_rgb(18, 21, 27),
+    card: egui::Color32::from_rgb(13, 16, 21),
+    text: egui::Color32::from_rgb(231, 235, 242),
+    muted: egui::Color32::from_rgb(134, 143, 158),
+    warn_bg: egui::Color32::from_rgb(58, 47, 20),
+    window: egui::Color32::from_rgb(20, 24, 31),
+    surface: egui::Color32::from_rgb(25, 29, 37),
+    stroke: egui::Color32::from_rgb(38, 44, 55),
+    hover: egui::Color32::from_rgb(31, 36, 45),
 };
 
 pub const PAL_LIGHT: Pal = Pal {
     bg: egui::Color32::from_rgb(243, 246, 250),
-    panel: egui::Color32::from_rgb(252, 253, 255),
-    card: egui::Color32::from_rgb(224, 229, 236),
-    text: egui::Color32::from_rgb(28, 32, 40),
-    muted: egui::Color32::from_rgb(98, 106, 120),
-    warn_bg: egui::Color32::from_rgb(255, 244, 214),
+    panel: egui::Color32::from_rgb(255, 255, 255),
+    card: egui::Color32::from_rgb(232, 236, 242),
+    text: egui::Color32::from_rgb(26, 31, 39),
+    muted: egui::Color32::from_rgb(105, 113, 127),
+    warn_bg: egui::Color32::from_rgb(255, 246, 216),
     window: egui::Color32::from_rgb(255, 255, 255),
+    surface: egui::Color32::from_rgb(247, 249, 252),
+    stroke: egui::Color32::from_rgb(217, 223, 232),
+    hover: egui::Color32::from_rgb(237, 241, 247),
 };
 
 pub fn palette(dark: bool) -> Pal {
@@ -183,6 +210,8 @@ pub struct CamNexusApp {
     tour_demo: bool,
     /// 上一帧气泡实测高度，用于下一帧定位
     tour_bubble_h: f32,
+    /// 本帧全屏按钮占用的位置：画面块的图标要避开它
+    fs_reserve: Option<egui::Rect>,
     /// 控件锚点，每帧重新登记，供引导高亮定位
     anchors: std::collections::HashMap<&'static str, egui::Rect>,
     // ---- FFmpeg 后端 ----
@@ -854,6 +883,7 @@ impl CamNexusApp {
             welcome: welcome_prompt,
             tour_demo: false,
             tour_bubble_h: 160.0,
+            fs_reserve: None,
             anchors: std::collections::HashMap::new(),
             active_sig: String::new(),
             fetch_state: None,
@@ -1248,7 +1278,10 @@ impl CamNexusApp {
                 }
             },
             |ui| {
-                if ui.button(tr("设置")).clicked() {
+                let set_btn = egui::Button::new(
+                    egui::RichText::new(tr("设置")).size(12.5).color(ACCENT),
+                );
+                if ui.add(set_btn).clicked() {
                     open_settings = true;
                 }
                 if ui.button(tr("扫描设备")).clicked() {
@@ -1267,8 +1300,18 @@ impl CamNexusApp {
                 if ui.button(tr("全部重连")).clicked() {
                     kick_all = true;
                 }
-                // 这一组按「右→左」排布，源码顺序与视觉顺序相反
-                ui.add_space(8.0);
+                // 这一组按「右→左」排布，源码顺序与视觉顺序相反。
+                // 用一条竖发丝线把「查看类」和「操作类」分开。
+                // 注意：横向布局里 ui.separator() 不出线，得自己画。
+                ui.add_space(5.0);
+                let (sep, _) =
+                    ui.allocate_exact_size(egui::vec2(1.0, 18.0), egui::Sense::hover());
+                ui.painter().vline(
+                    sep.center().x,
+                    sep.y_range(),
+                    egui::Stroke::new(1.0, p.stroke),
+                );
+                ui.add_space(5.0);
                 if ui.button(tr("关于")).clicked() {
                     open_about = true;
                 }
@@ -1409,6 +1452,10 @@ impl CamNexusApp {
         let ox = avail.left() + (avail.width() - grid_w) * 0.5;
         let oy = avail.top() + (avail.height() - grid_h) * 0.5;
 
+        // 全屏按钮固定贴在画布右下角，先登记它占的位置，
+        // 让压在下面的画面块把图标左移，避免两者叠在一起
+        self.fs_reserve = Some(fs_btn_rect(avail));
+
         // 全屏：自由布局（可拖动/缩放/吸附），不再走网格
         if self.fullscreen {
             self.free_canvas(ui, &visible, avail);
@@ -1435,6 +1482,30 @@ impl CamNexusApp {
         self.fullscreen_button(ui, avail);
     }
 
+    /// 这一块画面需要为全屏按钮让出多少像素（0 = 不用让）
+    fn fs_row_shift(&self, tile: egui::Rect) -> f32 {
+        let Some(avoid) = self.fs_reserve else {
+            return 0.0;
+        };
+        // 太窄的格子让位后图标会挤到左边，索性不动
+        if tile.width() < 150.0 {
+            return 0.0;
+        }
+        // 未偏移时图标行占据的范围（含 hover 外扩）
+        let row = egui::Rect::from_min_max(
+            egui::pos2(
+                tile.right() - 8.0 - 24.0 - 8.0 - 24.0 - 6.0,
+                tile.bottom() - 8.0 - 24.0 - 6.0,
+            ),
+            egui::pos2(tile.right() - 8.0 + 6.0, tile.bottom() - 8.0 + 6.0),
+        );
+        if row.intersects(avoid) {
+            avoid.width() + 12.0
+        } else {
+            0.0
+        }
+    }
+
     /// 右下角全屏按钮。
     ///
     /// 用 Foreground 层的 Area：画块自带的音量/录制按钮就在右下角，
@@ -1452,14 +1523,12 @@ impl CamNexusApp {
                 return;
             }
         }
-        let size = 34.0;
+        let size = FS_BTN_SIZE;
+        let btn = fs_btn_rect(area);
         let mut clicked = false;
         egui::Area::new(egui::Id::unique("btn_fullscreen"))
             .order(egui::Order::Foreground)
-            .fixed_pos(egui::pos2(
-                area.right() - size - 10.0,
-                area.bottom() - size - 10.0,
-            ))
+            .fixed_pos(btn.min)
             .show(ui.ctx(), |ui| {
                 let (rect, resp) =
                     ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::click());
@@ -1797,26 +1866,130 @@ impl CamNexusApp {
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
     }
 
+    /// 没有任何通道时的引导页。
+    ///
+    /// 空状态是用户看到的第一屏，只放两行字太浪费——
+    /// 直接给出两条可点的路径，比让他自己去找顶栏按钮好。
     fn empty_hint(&mut self, ui: &mut egui::Ui) {
         let p = self.pal();
         let rect = ui.available_rect_before_wrap();
         ui.allocate_space(rect.size());
+
         let painter = ui.painter_at(rect);
         let center = rect.center();
+
+        // 图标：一个简化的摄像机轮廓，用几何图形画，不依赖图片资源
+        let icon_c = center - egui::vec2(0.0, 74.0);
+        let body = egui::Rect::from_center_size(icon_c, egui::vec2(38.0, 26.0));
+        painter.rect_stroke(
+            body,
+            egui::CornerRadius::same(6),
+            egui::Stroke::new(1.6, p.muted),
+            egui::StrokeKind::Inside,
+        );
+        // 镜头
+        painter.circle_stroke(
+            icon_c,
+            8.0,
+            egui::Stroke::new(1.6, p.muted),
+        );
+        painter.circle_filled(icon_c, 2.6, p.muted);
+        // 顶部支架
+        let mut pts = vec![
+            egui::pos2(body.right() + 2.0, body.center().y - 6.0),
+            egui::pos2(body.right() + 12.0, body.center().y - 11.0),
+            egui::pos2(body.right() + 12.0, body.center().y + 11.0),
+            egui::pos2(body.right() + 2.0, body.center().y + 6.0),
+        ];
+        pts.push(pts[0]);
+        painter.add(egui::Shape::line(
+            pts,
+            egui::Stroke::new(1.6, p.muted),
+        ));
+
         painter.text(
-            center - egui::vec2(0.0, 18.0),
+            center - egui::vec2(0.0, 20.0),
             egui::Align2::CENTER_CENTER,
             tr("还没有视频通道"),
             egui::FontId::proportional(20.0),
             p.text,
         );
         painter.text(
-            center + egui::vec2(0.0, 14.0),
+            center + egui::vec2(0.0, 8.0),
             egui::Align2::CENTER_CENTER,
-            tr("点右上角「扫描设备」自动发现局域网摄像机，或到「设置」里手动填写 RTSP 地址"),
+            tr("扫描局域网自动发现摄像机，或者手动填写一个 RTSP 地址"),
             egui::FontId::proportional(13.0),
             p.muted,
         );
+
+        // 两个入口：主动作实心，次动作描边
+        let btn_size = egui::vec2(120.0, 34.0);
+        let gap = 10.0;
+        let total_w = btn_size.x * 2.0 + gap;
+        let top_left = egui::pos2(center.x - total_w * 0.5, center.y + 34.0);
+
+        let scan_rect = egui::Rect::from_min_size(top_left, btn_size);
+        let resp_scan = ui.interact(
+            scan_rect,
+            ui.make_persistent_id("empty_scan"),
+            egui::Sense::click(),
+        );
+        let manual_rect =
+            egui::Rect::from_min_size(top_left + egui::vec2(btn_size.x + gap, 0.0), btn_size);
+        let resp_manual = ui.interact(
+            manual_rect,
+            ui.make_persistent_id("empty_manual"),
+            egui::Sense::click(),
+        );
+
+        let painter = ui.painter_at(rect);
+        // 主按钮
+        let scan_bg = if resp_scan.hovered() {
+            ACCENT.gamma_multiply(1.15)
+        } else {
+            ACCENT
+        };
+        painter.rect_filled(scan_rect, egui::CornerRadius::same(8), scan_bg);
+        painter.text(
+            scan_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            tr("扫描设备"),
+            egui::FontId::proportional(13.0),
+            egui::Color32::WHITE,
+        );
+        // 次按钮
+        let manual_bg = if resp_manual.hovered() {
+            p.hover
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        painter.rect_filled(manual_rect, egui::CornerRadius::same(8), manual_bg);
+        painter.rect_stroke(
+            manual_rect,
+            egui::CornerRadius::same(8),
+            egui::Stroke::new(1.0, p.stroke),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            manual_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            tr("手动添加"),
+            egui::FontId::proportional(13.0),
+            p.text,
+        );
+
+        if resp_scan
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            self.show_scan = true;
+        }
+        if resp_manual
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            self.show_settings = true;
+        }
     }
 
     fn draw_tile(
@@ -1948,11 +2121,11 @@ impl CamNexusApp {
         let label = name.clone();
         let galley = painter.layout_no_wrap(label, egui::FontId::proportional(12.0), CHIP_TEXT);
         let chip = egui::Rect::from_min_size(
-            egui::pos2(rect.left() + pad, rect.bottom() - pad - galley.size().y - 6.0),
-            galley.size() + egui::vec2(12.0, 6.0),
+            egui::pos2(rect.left() + pad, rect.bottom() - pad - galley.size().y - 8.0),
+            galley.size() + egui::vec2(16.0, 8.0),
         );
-        painter.rect_filled(chip, egui::CornerRadius::ZERO, egui::Color32::from_black_alpha(150));
-        painter.galley(chip.min + egui::vec2(6.0, 3.0), galley, p.text);
+        painter.rect_filled(chip, egui::CornerRadius::same(6), egui::Color32::from_black_alpha(140));
+        painter.galley(chip.min + egui::vec2(8.0, 4.0), galley, CHIP_TEXT);
 
         let (scolor, txt) = match status.state {
             State::Live => (OK, format!("{:.0} fps", status.fps)),
@@ -1961,12 +2134,12 @@ impl CamNexusApp {
         };
         let g2 = painter.layout_no_wrap(txt, egui::FontId::proportional(11.5), scolor);
         let chip2 = egui::Rect::from_min_size(
-            egui::pos2(rect.right() - pad - g2.size().x - 16.0, rect.top() + pad),
-            g2.size() + egui::vec2(16.0, 6.0),
+            egui::pos2(rect.right() - pad - g2.size().x - 24.0, rect.top() + pad),
+            g2.size() + egui::vec2(24.0, 8.0),
         );
-        painter.rect_filled(chip2, egui::CornerRadius::ZERO, egui::Color32::from_black_alpha(150));
-        painter.circle_filled(chip2.left_center() + egui::vec2(6.0, 0.0), 3.0, scolor);
-        painter.galley(chip2.min + egui::vec2(12.0, 3.0), g2, scolor);
+        painter.rect_filled(chip2, egui::CornerRadius::same(6), egui::Color32::from_black_alpha(140));
+        painter.circle_filled(chip2.left_center() + egui::vec2(9.0, 0.0), 3.0, scolor);
+        painter.galley(chip2.min + egui::vec2(16.0, 4.0), g2, scolor);
 
         // 目标检测结果：画框 + 类别/置信度
         if let Some(dets) = self.detect.as_ref().and_then(|d| d.active(idx)) {
@@ -2002,17 +2175,41 @@ impl CamNexusApp {
         // 录制开关：喇叭左边。白=未录，红=录制中
         let rec_on = self.records.is_recording(idx);
         let rec_size = 24.0;
+        // 被全屏按钮压住时整排左移；此时纵向也对齐到按钮中心
+        let shift = self.fs_row_shift(rect);
+        let pad = if shift > 0.0 { 8.0 + shift } else { 8.0 };
+        let pad_y = if shift > 0.0 { 15.0 } else { 8.0 };
         let rec_anchor = egui::Rect::from_min_size(
-            egui::pos2(
-                rect.right() - 8.0 - rec_size,
-                rect.bottom() - 8.0 - rec_size,
-            ),
+            egui::pos2(rect.right() - pad - rec_size, rect.bottom() - pad_y - rec_size),
             egui::vec2(rec_size, rec_size),
         );
         let rec_rect = egui::Rect::from_min_size(
             egui::pos2(rec_anchor.left() - 8.0 - rec_size, rec_anchor.top()),
             egui::vec2(rec_size, rec_size),
         );
+        // 音频图标位置先算出来：两个图标共用一块底板，得在绘制之前就知道总范围
+        let audible = self.audio_idx == Some(idx);
+        let size = 24.0;
+        let icon_rect = egui::Rect::from_min_size(
+            egui::pos2(rect.right() - pad - size, rect.bottom() - pad_y - size),
+            egui::vec2(size, size),
+        );
+
+        // 控制组底板：亮画面上纯白图标会糊掉，垫一层半透明底。
+        // 格子太小时不画，否则底板会占掉大半个画面
+        if rect.width() > 120.0 {
+            let p = ui.painter_at(rect);
+            let group = egui::Rect::from_min_max(
+                rec_rect.min - egui::vec2(6.0, 5.0),
+                icon_rect.max + egui::vec2(6.0, 5.0),
+            );
+            p.rect_filled(
+                group,
+                egui::CornerRadius::same(9),
+                egui::Color32::from_black_alpha(105),
+            );
+        }
+
         let resp_rec = ui.interact(
             rec_rect.expand(7.0),
             ui.make_persistent_id(("record", idx)),
@@ -2043,13 +2240,6 @@ impl CamNexusApp {
         }
 
         // 音频开关（同一时刻只允许一路）：右下角图标，透明底
-        let audible = self.audio_idx == Some(idx);
-        let size = 24.0;
-        let pad = 8.0;
-        let icon_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.right() - pad - size, rect.bottom() - pad - size),
-            egui::vec2(size, size),
-        );
         let resp_btn = ui.interact(
             icon_rect.expand(7.0),
             ui.make_persistent_id(("audio", idx)),
@@ -2284,6 +2474,7 @@ impl CamNexusApp {
         if !self.show_settings {
             return;
         }
+        let p = self.pal();
         let mut open = true;
         let mut save = false;
         let mut save_reconnect = false;
@@ -2310,13 +2501,24 @@ impl CamNexusApp {
                 egui::Panel::bottom("set_actions")
                     .frame(
                         egui::Frame::NONE
-                            .inner_margin(egui::Margin::symmetric(0, 8))
-                            .fill(ui.visuals().window_fill),
+                            .inner_margin(egui::Margin::symmetric(0, 10))
+                            .fill(ui.visuals().window_fill)
+                            // 上边一条发丝线，把操作区和表单分开
+                            .stroke(egui::Stroke::new(1.0, p.stroke)),
                     )
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            let primary = egui::Button::new(
+                                egui::RichText::new(tr("保存"))
+                                    .size(12.5)
+                                    .color(egui::Color32::WHITE),
+                            )
+                            .fill(ACCENT)
+                            .stroke(egui::Stroke::NONE)
+                            .corner_radius(egui::CornerRadius::same(7))
+                            .min_size(egui::vec2(76.0, 28.0));
                             if ui
-                                .button(tr("保存"))
+                                .add(primary)
                                 .on_hover_text(
                                     tr("保存全部设置。主题、音量、提示立即生效；通道与解码参数需重连才生效"),
                                 )
@@ -2330,7 +2532,6 @@ impl CamNexusApp {
                             if ui.button(tr("取消")).clicked() {
                                 cancel = true;
                             }
-                            ui.add_space(12.0);
                             if ui
                                 .button(tr("新手引导"))
                                 .on_hover_text(tr("重新播放界面导览（不会修改现有设置）"))
@@ -2354,11 +2555,28 @@ impl CamNexusApp {
                     .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(0, 6)))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
+                            // 分段控件：选中的用强调色实心，未选中的透明，
+                            // 比默认的 selectable_label 更像成品软件
+                            ui.spacing_mut().item_spacing.x = 4.0;
                             for (tab, name) in SET_TABS {
-                                if ui
-                                    .selectable_label(self.settings_tab == *tab, tr(name))
-                                    .clicked()
-                                {
+                                let active = self.settings_tab == *tab;
+                                let label = egui::RichText::new(tr(name)).size(12.5).color(
+                                    if active {
+                                        egui::Color32::WHITE
+                                    } else {
+                                        p.muted
+                                    },
+                                );
+                                let btn = egui::Button::new(label)
+                                    .fill(if active {
+                                        ACCENT
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    })
+                                    .stroke(egui::Stroke::NONE)
+                                    .corner_radius(egui::CornerRadius::same(7))
+                                    .min_size(egui::vec2(72.0, 26.0));
+                                if ui.add(btn).clicked() {
                                     self.settings_tab = *tab;
                                 }
                             }
@@ -2456,7 +2674,9 @@ impl CamNexusApp {
             ui.push_id(("ch", i), |ui| {
                 egui::Frame::NONE
                     .fill(p.card)
-                    .inner_margin(egui::Margin::same(10))
+                    .stroke(egui::Stroke::new(1.0, p.stroke))
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .inner_margin(egui::Margin::same(12))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.add(
@@ -3926,6 +4146,8 @@ impl eframe::App for CamNexusApp {
                 .frame(
                     egui::Frame::NONE
                         .fill(p.panel)
+                        // 一条 1px 发丝线，替代阴影来分界
+                        .stroke(egui::Stroke::new(1.0, p.stroke))
                         .inner_margin(egui::Margin::symmetric(14, 10)),
                 )
                 .show(ui, |ui| self.top_bar(ui));
@@ -4049,28 +4271,70 @@ fn apply_style(ctx: &egui::Context, dark: bool) {
 
 fn customize_style(style: &mut egui::Style, dark: bool) {
     let p = palette(dark);
-    style.visuals = if dark {
+    let mut v = if dark {
         egui::Visuals::dark()
     } else {
         egui::Visuals::light()
     };
-    style.visuals.panel_fill = p.panel;
-    style.visuals.window_fill = p.window;
-    style.visuals.faint_bg_color = if dark {
-        egui::Color32::from_rgb(26, 32, 40)
+
+    let radius = egui::CornerRadius::same(8);
+
+    // 面板与窗口
+    v.panel_fill = p.panel;
+    v.window_fill = p.window;
+    v.faint_bg_color = p.surface;
+    v.extreme_bg_color = if dark {
+        egui::Color32::from_rgb(9, 11, 15)
     } else {
-        egui::Color32::from_rgb(238, 242, 247)
+        egui::Color32::WHITE
     };
-    style.visuals.extreme_bg_color = if dark {
-        egui::Color32::from_rgb(10, 13, 18)
-    } else {
-        egui::Color32::from_rgb(255, 255, 255)
-    };
-    style.visuals.override_text_color = if dark { Some(p.text) } else { None };
-    style.visuals.widgets.active.bg_fill = ACCENT;
-    style.visuals.selection.bg_fill = ACCENT.gamma_multiply(0.45);
-    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
-    style.spacing.button_padding = egui::vec2(10.0, 5.0);
+    v.window_stroke = egui::Stroke::new(1.0, p.stroke);
+    v.window_corner_radius = egui::CornerRadius::same(12);
+    v.menu_corner_radius = egui::CornerRadius::same(10);
+    v.striped = false;
+
+    // 控件四态：默认无填充，靠 hover 提亮 + 描边，而不是一块灰色方块
+    v.widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
+    v.widgets.noninteractive.weak_bg_fill = egui::Color32::TRANSPARENT;
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, p.text);
+    v.widgets.noninteractive.corner_radius = radius;
+
+    v.widgets.inactive.bg_fill = p.surface;
+    v.widgets.inactive.weak_bg_fill = egui::Color32::from_white_alpha(6);
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, p.stroke);
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, p.text);
+    v.widgets.inactive.corner_radius = radius;
+
+    v.widgets.hovered.bg_fill = p.hover;
+    v.widgets.hovered.weak_bg_fill = p.hover;
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, p.stroke.gamma_multiply(1.5));
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, p.text);
+    v.widgets.hovered.corner_radius = radius;
+
+    v.widgets.active.bg_fill = ACCENT;
+    v.widgets.active.weak_bg_fill = ACCENT;
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
+    v.widgets.active.corner_radius = radius;
+
+    v.widgets.open.bg_fill = p.hover;
+    v.widgets.open.weak_bg_fill = p.hover;
+    v.widgets.open.bg_stroke = egui::Stroke::new(1.0, p.stroke);
+    v.widgets.open.corner_radius = radius;
+
+    // 选中与文本
+    v.selection.bg_fill = ACCENT.gamma_multiply(0.35);
+    v.selection.stroke = egui::Stroke::new(1.0, ACCENT);
+
+    style.visuals = v;
+
+    // 间距：比默认松一点，信息不挤在一起
+    style.spacing.item_spacing = egui::vec2(9.0, 8.0);
+    style.spacing.button_padding = egui::vec2(12.0, 6.0);
+    style.spacing.menu_margin = egui::Margin::same(6);
+    style.spacing.window_margin = egui::Margin::same(14);
+    style.spacing.interact_size.y = 26.0;
 }
 
 #[cfg(test)]
