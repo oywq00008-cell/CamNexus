@@ -150,6 +150,12 @@ pub struct CamNexusApp {
     diag: Evaluator,
     main_cpu: sys::CpuMeter,
     sys_cpu: sys::SysCpuMeter,
+    /// 本机网络吞吐采样器与最近一次读数
+    net: sys::NetMeter,
+    net_down: f64,
+    net_up: f64,
+    /// 物理内存占用（%）
+    mem_pct: f32,
     last_sample: Instant,
     upload_ms: std::collections::HashMap<usize, f32>,
     show_details: bool,
@@ -851,6 +857,10 @@ impl CamNexusApp {
             diag: Evaluator::new(),
             main_cpu: sys::CpuMeter::default(),
             sys_cpu: sys::SysCpuMeter::default(),
+            net: sys::NetMeter::default(),
+            net_down: 0.0,
+            net_up: 0.0,
+            mem_pct: 0.0,
             last_sample: Instant::now(),
             upload_ms: Default::default(),
             show_details: false,
@@ -1233,10 +1243,210 @@ impl CamNexusApp {
     }
 
     // ---------------------------------------------------------------- 顶栏
+    /// 顶栏左侧的数据栏。
+    ///
+    /// 一个圆角矩形包住若干指标，右端三点打开勾选面板。
+    /// 返回 `Some(新配置)` 表示用户刚改过勾选项，由调用方落盘。
+    fn data_bar(&self, ui: &mut egui::Ui) -> Option<crate::config::BarCfg> {
+        let p = self.pal();
+        let bar = self.cfg.bar;
+        let (live, total) = self.online_count();
+
+        // 一段 = 可选色点 + 文本
+        struct Seg {
+            dot: Option<egui::Color32>,
+            text: String,
+            color: egui::Color32,
+        }
+        let mut segs: Vec<Seg> = Vec::new();
+
+        if bar.online {
+            let (dot, text, color) = if total == 0 {
+                (p.muted, tr("未配置通道").to_string(), p.muted)
+            } else if live == total {
+                (OK, i18n::online(live, total), p.text)
+            } else if live == 0 {
+                (ERR, i18n::online(0, total), p.text)
+            } else {
+                (WARN, i18n::online(live, total), p.text)
+            };
+            segs.push(Seg {
+                dot: Some(dot),
+                text,
+                color,
+            });
+        }
+        if bar.clock {
+            let (_, _, _, h, mi, s) = sys::local_now();
+            segs.push(Seg {
+                dot: None,
+                text: format!("{h:02}:{mi:02}:{s:02}"),
+                color: p.text,
+            });
+        }
+        if bar.net {
+            segs.push(Seg {
+                dot: Some(ACCENT),
+                text: format!(
+                    "↓{} ↑{}",
+                    sys::human_rate(self.net_down),
+                    sys::human_rate(self.net_up)
+                ),
+                color: p.text,
+            });
+        }
+        if bar.cpu {
+            let v = self.sys_cpu.pct;
+            let color = if v < 60.0 {
+                OK
+            } else if v < 85.0 {
+                WARN
+            } else {
+                ERR
+            };
+            segs.push(Seg {
+                dot: None,
+                text: format!("CPU {v:.0}%"),
+                color,
+            });
+        }
+        if bar.mem {
+            let v = self.mem_pct;
+            let color = if v < 75.0 {
+                p.text
+            } else if v < 90.0 {
+                WARN
+            } else {
+                ERR
+            };
+            segs.push(Seg {
+                dot: None,
+                text: i18n::bar_mem(v),
+                color,
+            });
+        }
+        if segs.is_empty() {
+            // 全不勾时留一个占位，否则栏会塌成一条竖线
+            segs.push(Seg {
+                dot: None,
+                text: tr("数据栏").to_string(),
+                color: p.muted,
+            });
+        }
+
+        let font = egui::FontId::proportional(12.5);
+        let seg_w: Vec<f32> = {
+            let painter = ui.painter();
+            segs.iter()
+                .map(|s| {
+                    let g = painter.layout_no_wrap(s.text.clone(), font.clone(), s.color);
+                    let dot_w = if s.dot.is_some() { 12.0 } else { 0.0 };
+                    dot_w + g.size().x
+                })
+                .collect()
+        };
+
+        const H: f32 = 30.0;
+        const PAD_X: f32 = 12.0;
+        const GAP: f32 = 10.0; // 文本与分隔线之间
+        const MENU_W: f32 = 26.0;
+
+        let mut w = PAD_X * 2.0 + MENU_W;
+        for (i, sw) in seg_w.iter().enumerate() {
+            if i > 0 {
+                w += GAP * 2.0 + 1.0;
+            }
+            w += sw;
+        }
+
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(w, H), egui::Sense::hover());
+        let painter = ui.painter();
+
+        painter.rect_filled(rect, egui::CornerRadius::same(8), p.surface);
+        painter.rect_stroke(
+            rect,
+            egui::CornerRadius::same(8),
+            egui::Stroke::new(1.0, p.stroke),
+            egui::StrokeKind::Inside,
+        );
+
+        let mut x = rect.left() + PAD_X;
+        let cy = rect.center().y;
+        for (i, seg) in segs.iter().enumerate() {
+            if i > 0 {
+                let lx = x + GAP;
+                painter.vline(
+                    lx,
+                    (cy - 7.0)..=(cy + 7.0),
+                    egui::Stroke::new(1.0, p.stroke),
+                );
+                x = lx + 1.0 + GAP;
+            }
+            if let Some(c) = seg.dot {
+                painter.circle_filled(egui::pos2(x + 4.0, cy), 3.2, c);
+                x += 12.0;
+            }
+            let g = painter.layout_no_wrap(seg.text.clone(), font.clone(), seg.color);
+            let h = g.size().y;
+            painter.galley(egui::pos2(x, cy - h * 0.5), g, seg.color);
+            x += seg_w[i] - if seg.dot.is_some() { 12.0 } else { 0.0 };
+        }
+
+        // 右端三点：可点，点开是勾选面板
+        let dots = egui::Rect::from_min_max(
+            egui::pos2(rect.right() - MENU_W, rect.top()),
+            egui::pos2(rect.right(), rect.bottom()),
+        );
+        let resp = ui.interact(
+            dots,
+            ui.make_persistent_id("bar_menu"),
+            egui::Sense::click(),
+        );
+        {
+            let p2 = ui.painter();
+            if resp.hovered() {
+                p2.rect_filled(
+                    dots.shrink(3.0),
+                    egui::CornerRadius::same(6),
+                    p.hover,
+                );
+            }
+            let color = if resp.hovered() { p.text } else { p.muted };
+            for k in -1..=1 {
+                p2.circle_filled(
+                    egui::pos2(dots.center().x, dots.center().y + k as f32 * 4.2),
+                    1.5,
+                    color,
+                );
+            }
+        }
+
+        let mut next = bar;
+        egui::Popup::menu(&resp).show(|ui| {
+            ui.set_min_width(168.0);
+            // 菜单行距比常规控件紧一点，读完一行不用跳很远
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.label(egui::RichText::new(tr("数据栏显示")).size(11.5).color(p.muted));
+            ui.add_space(2.0);
+            ui.checkbox(&mut next.online, tr("在线通道数"));
+            ui.checkbox(&mut next.clock, tr("时间"));
+            ui.checkbox(&mut next.net, tr("网络速率"))
+                .on_hover_text(tr("整机所有物理网卡的合计收发，含系统更新、云同步等后台流量"));
+            ui.checkbox(&mut next.cpu, tr("CPU 占用"));
+            ui.checkbox(&mut next.mem, tr("内存占用"));
+        });
+
+        let changed = next.online != bar.online
+            || next.clock != bar.clock
+            || next.net != bar.net
+            || next.cpu != bar.cpu
+            || next.mem != bar.mem;
+        if changed { Some(next) } else { None }
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let p = self.pal();
         self.anchors.insert(tour::anchor::TOP_BAR, ui.max_rect());
-        let (live, total) = self.online_count();
         let mut open_settings = false;
         let mut open_scan = false;
         let mut kick_all = false;
@@ -1245,25 +1455,14 @@ impl CamNexusApp {
         let mut open_logs = false;
         let mut open_about = false;
         let mut toggle_detect = false;
+        let mut bar_change: Option<crate::config::BarCfg> = None;
 
         egui::containers::Sides::new().height(36.0).show(
             ui,
             |ui| {
-                ui.label(egui::RichText::new("CamNexus").size(19.0).strong().color(p.text));
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(tr("监控中枢")).size(12.0).color(p.muted));
-                ui.add_space(12.0);
-                let (dot, label) = if total == 0 {
-                    (p.muted, tr("未配置通道").to_string())
-                } else if live == total {
-                    (OK, i18n::online(live, total))
-                } else if live == 0 {
-                    (ERR, i18n::online(0, total))
-                } else {
-                    (WARN, i18n::online(live, total))
-                };
-                ui.label(egui::RichText::new("●").size(11.0).color(dot));
-                ui.label(egui::RichText::new(label).size(12.5).color(p.muted));
+                if let Some(nb) = self.data_bar(ui) {
+                    bar_change = Some(nb);
+                }
 
                 if let Some(i) = self.audio_idx {
                     ui.add_space(10.0);
@@ -1344,6 +1543,12 @@ impl CamNexusApp {
                 }
             },
         );
+
+        // 数据栏勾选项变了就立刻存盘，下次启动保持一致
+        if let Some(nb) = bar_change {
+            self.cfg.bar = nb;
+            let _ = self.cfg.save();
+        }
 
         if toggle_detect {
             match self.detect.as_mut() {
@@ -3617,6 +3822,14 @@ impl CamNexusApp {
 
         let main_cpu = self.main_cpu.sample(sys::current_pid());
         let sys_cpu = self.sys_cpu.sample();
+
+        // 数据栏用的整机指标
+        let (dn, up) = self.net.sample();
+        self.net_down = dn;
+        self.net_up = up;
+        if let Some(m) = sys::memory_load() {
+            self.mem_pct = m;
+        }
 
         let mut streams = Vec::new();
         let mut decode_total = 0.0f32;

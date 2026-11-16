@@ -256,6 +256,35 @@ pub fn derive_sub_url(main: &str) -> Option<String> {
     None
 }
 
+/// 顶栏数据栏显示哪些项目
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BarCfg {
+    /// 在线通道数（默认）
+    pub online: bool,
+    /// 本机时间
+    pub clock: bool,
+    /// 本机上行/下行速率
+    pub net: bool,
+    /// 整机 CPU 占用
+    pub cpu: bool,
+    /// 物理内存占用
+    pub mem: bool,
+}
+
+impl Default for BarCfg {
+    fn default() -> Self {
+        // 默认只显示在线数：数据栏是给人用的，一上来塞满反而看不清
+        Self {
+            online: true,
+            clock: false,
+            net: false,
+            cpu: false,
+            mem: false,
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(default)]
 pub struct AppConfig {
@@ -288,6 +317,8 @@ pub struct AppConfig {
     pub detect: DetectCfg,
     /// 界面语言
     pub lang: crate::i18n::Lang,
+    /// 顶栏数据栏显示项
+    pub bar: BarCfg,
 }
 
 /// 新手引导状态
@@ -325,6 +356,7 @@ impl Default for AppConfig {
             tiles: Vec::new(),
             detect: DetectCfg::default(),
             lang: crate::i18n::Lang::Zh,
+            bar: BarCfg::default(),
         }
     }
 }

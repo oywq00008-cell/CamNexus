@@ -454,6 +454,14 @@ pub fn wrong_credentials(detail: &str) -> String {
 }
 
 /// 录像启动失败，附带 ffmpeg 的真实报错（没有报错时退化成原来的提示）
+/// 数据栏里的内存占用
+pub fn bar_mem(pct: f32) -> String {
+    match lang() {
+        Lang::Zh => format!("内存 {pct:.0}%"),
+        Lang::En => format!("RAM {pct:.0}%"),
+    }
+}
+
 pub fn rec_fail_detail(n: impl std::fmt::Display, detail: &str) -> String {
     let d = detail.trim();
     if d.is_empty() {
@@ -810,6 +818,12 @@ const PAIRS: &[(&str, &str)] = &[
     ("连接中断，正在重试", "Connection lost, retrying"),
     ("ffmpeg 已退出", "ffmpeg exited"),
     ("无法启动 ffmpeg", "Cannot start ffmpeg"),
+    ("在线通道数", "Live channels"),
+    ("整机所有物理网卡的合计收发，含系统更新、云同步等后台流量", "Total traffic of all physical adapters, including OS updates and cloud sync"),
+    ("数据栏显示", "Show in the data bar"),
+    ("数据栏", "Data bar"),
+    ("网络速率", "Network rate"),
+    ("内存占用", "Memory usage"),
     ("录像启动失败", "Recording failed to start"),
     ("录像连续失败，已停止", "recording kept failing and was stopped"),
     ("录像结束", "Recording finished"),

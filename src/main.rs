@@ -41,6 +41,12 @@ fn main() -> eframe::Result<()> {
     i18n::set_lang(cfg.lang);
     let open_diag = args.iter().any(|a| a == "--diag");
     // --detect-test <图片>：用 ffmpeg 解码后跑一次检测，打印结果（自检用）
+    // --net-test：打印各网卡 2 秒内的收发速率，用于核对数据栏的读数
+    if args.iter().any(|a| a == "--net-test") {
+        net_test();
+        return Ok(());
+    }
+
     // --audio-test N：验证第 N 路（1 起）的音频是否随显示流一起到达
     if let Some(i) = args.iter().position(|a| a == "--audio-test")
         && let Some(n) = args.get(i + 1).and_then(|s| s.parse::<usize>().ok())
@@ -186,6 +192,40 @@ fn image_size(buf: &[u8]) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+
+/// 自检：把每个网络接口的实际速率打出来，用来核对数据栏读数。
+fn net_test() {
+    use std::time::Duration;
+
+    let a = sys::net_ifaces();
+    std::thread::sleep(Duration::from_secs(2));
+    let b = sys::net_ifaces();
+
+    println!("{:<34} {:>12} {:>12}  {}", "网卡", "下行", "上行", "计入");
+    let mut tot_dn = 0.0;
+    let mut tot_up = 0.0;
+    for (name, in0, out0, counted) in &a {
+        let Some((_, in1, out1, _)) = b.iter().find(|(n, _, _, _)| n == name) else {
+            continue;
+        };
+        let dn = in1.saturating_sub(*in0) as f64 / 2.0;
+        let up = out1.saturating_sub(*out0) as f64 / 2.0;
+        if *counted {
+            tot_dn += dn;
+            tot_up += up;
+        }
+        println!(
+            "{:<34} {:>12} {:>12}  {}",
+            name,
+            sys::human_rate(dn),
+            sys::human_rate(up),
+            if *counted { "是" } else { "否" }
+        );
+    }
+    println!();
+    println!("统计合计：下行 {}  上行 {}", sys::human_rate(tot_dn), sys::human_rate(tot_up));
 }
 
 /// 自检：起一路流，观察 8 秒，报告画面与音频是否都到达。

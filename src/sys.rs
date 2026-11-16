@@ -235,3 +235,160 @@ fn civil_from_days(z: i64) -> (i32, i32, i32) {
         d as i32,
     )
 }
+
+// ---------------------------------------------------------------- 网络与内存
+
+/// 本机网络吞吐（所有已连接的非回环网卡合计）。
+///
+/// 数据栏里显示的是「这台机器当前收/发多少」，包含录像回放、
+/// 系统更新等一切流量——它不是 CamNexus 自己的流量。
+#[cfg(windows)]
+#[derive(Default)]
+pub struct NetMeter {
+    last: Option<(std::time::Instant, u64, u64)>,
+    down_bps: f64,
+    up_bps: f64,
+}
+
+#[cfg(windows)]
+impl NetMeter {
+    /// 返回 (下行, 上行) 字节/秒。首次调用只建立基线，返回 0。
+    pub fn sample(&mut self) -> (f64, f64) {
+        let Some((rx, tx)) = if_counters() else {
+            return (self.down_bps, self.up_bps);
+        };
+        let now = std::time::Instant::now();
+        if let Some((t0, rx0, tx0)) = self.last {
+            let dt = now.duration_since(t0).as_secs_f64();
+            if dt >= 0.4 {
+                // 计数器可能被系统重置，用 saturating 防止出现负数
+                let d_rx = rx.saturating_sub(rx0) as f64 / dt;
+                let d_tx = tx.saturating_sub(tx0) as f64 / dt;
+                // 指数平滑：数字不跳，读数仍然及时
+                self.down_bps = self.down_bps * 0.45 + d_rx * 0.55;
+                self.up_bps = self.up_bps * 0.45 + d_tx * 0.55;
+                self.last = Some((now, rx, tx));
+            }
+        } else {
+            self.last = Some((now, rx, tx));
+        }
+        (self.down_bps, self.up_bps)
+    }
+}
+
+#[cfg(windows)]
+fn if_counters() -> Option<(u64, u64)> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIfTable2, IF_TYPE_SOFTWARE_LOOPBACK, MIB_IF_TABLE2,
+    };
+    use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+
+    unsafe {
+        let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+        // 返回 0 表示 NO_ERROR
+        if GetIfTable2(&mut table) != 0 || table.is_null() {
+            return None;
+        }
+        let n = (*table).NumEntries as usize;
+        // Table 声明成长度 1 的数组，实际是变长结构，按 NumEntries 取
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
+        let mut rx = 0u64;
+        let mut tx = 0u64;
+        for r in rows {
+            if r.Type == IF_TYPE_SOFTWARE_LOOPBACK || r.OperStatus != IfOperStatusUp {
+                continue;
+            }
+            // 只要物理网卡：Hyper-V / VMware / 远程桌面的虚拟网卡会把流量重复计一遍，
+            // 实测不筛选时上行会虚高到十几 MB/s（真实只有几百 KB/s）。
+            // _bitfield 的最低位就是 HardwareInterface。
+            if r.InterfaceAndOperStatusFlags._bitfield & 1 == 0 {
+                continue;
+            }
+            rx += r.InOctets;
+            tx += r.OutOctets;
+        }
+        FreeMibTable(table as *const core::ffi::c_void);
+        Some((rx, tx))
+    }
+}
+
+#[cfg(not(windows))]
+#[derive(Default)]
+pub struct NetMeter;
+
+#[cfg(not(windows))]
+impl NetMeter {
+    pub fn sample(&mut self) -> (f64, f64) {
+        (0.0, 0.0)
+    }
+}
+
+/// 物理内存占用百分比（0-100）
+#[cfg(windows)]
+pub fn memory_load() -> Option<f32> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    let ok = unsafe { GlobalMemoryStatusEx(&mut m) };
+    if ok != 0 {
+        Some(m.dwMemoryLoad as f32)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(windows))]
+pub fn memory_load() -> Option<f32> {
+    None
+}
+
+
+/// 诊断用：列出每个网络接口的累计收发字节，以及它是否被计入速率统计
+#[cfg(windows)]
+pub fn net_ifaces() -> Vec<(String, u64, u64, bool)> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        FreeMibTable, GetIfTable2, IF_TYPE_SOFTWARE_LOOPBACK, MIB_IF_TABLE2,
+    };
+    use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
+
+    let mut out = Vec::new();
+    unsafe {
+        let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+        if GetIfTable2(&mut table) != 0 || table.is_null() {
+            return out;
+        }
+        let n = (*table).NumEntries as usize;
+        let rows = std::slice::from_raw_parts((*table).Table.as_ptr(), n);
+        for r in rows {
+            let name = String::from_utf16_lossy(
+                &r.Alias[..r.Alias.iter().position(|c| *c == 0).unwrap_or(r.Alias.len())],
+            );
+            let up = r.OperStatus == IfOperStatusUp;
+            let hw = r.InterfaceAndOperStatusFlags._bitfield & 1 != 0;
+            let counted = up && hw && r.Type != IF_TYPE_SOFTWARE_LOOPBACK;
+            if up {
+                out.push((name, r.InOctets, r.OutOctets, counted));
+            }
+        }
+        FreeMibTable(table as *const core::ffi::c_void);
+    }
+    out
+}
+
+#[cfg(not(windows))]
+pub fn net_ifaces() -> Vec<(String, u64, u64, bool)> {
+    Vec::new()
+}
+
+/// 字节/秒 → 便于阅读的短字符串（B/s、KB/s、MB/s）
+pub fn human_rate(bytes_per_sec: f64) -> String {
+    let v = bytes_per_sec.max(0.0);
+    if v < 1024.0 {
+        format!("{v:.0} B/s")
+    } else if v < 1024.0 * 1024.0 {
+        format!("{:.0} KB/s", v / 1024.0)
+    } else {
+        format!("{:.1} MB/s", v / (1024.0 * 1024.0))
+    }
+}
