@@ -319,6 +319,12 @@ pub struct AppConfig {
     pub lang: crate::i18n::Lang,
     /// 顶栏数据栏显示项
     pub bar: BarCfg,
+    /// 开机自启（写 HKCU 的 Run 项）
+    pub autostart: bool,
+    /// 进程守护：崩溃后由守护进程自动拉起
+    pub guard: bool,
+    /// 启动软件后自动开始录像（只在摄像机在线时才真正开录）
+    pub auto_record: bool,
 }
 
 /// 新手引导状态
@@ -357,6 +363,9 @@ impl Default for AppConfig {
             detect: DetectCfg::default(),
             lang: crate::i18n::Lang::Zh,
             bar: BarCfg::default(),
+            autostart: false,
+            guard: false,
+            auto_record: false,
         }
     }
 }
@@ -365,6 +374,13 @@ pub fn exe_dir() -> PathBuf {
     std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// 数据目录：日志、守护标记、模型缓存都放这里
+pub fn data_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(|p| PathBuf::from(p).join("CamNexus"))
         .unwrap_or_else(|| PathBuf::from("."))
 }
 

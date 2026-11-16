@@ -483,6 +483,31 @@ pub fn rec_gave_up(name: &str) -> String {
     }
 }
 
+/// 网络类失败：说明多久后重试，避免看起来像卡死
+pub fn rec_fail_retry(n: impl std::fmt::Display, secs: u64, detail: &str) -> String {
+    let d = detail.trim();
+    match lang() {
+        Lang::Zh => format!("录像启动失败（第 {n} 次，{secs} 秒后重试）：{d}"),
+        Lang::En => format!("Recording failed (attempt {n}, retrying in {secs}s): {d}"),
+    }
+}
+
+/// 段中途断了（不是到点，也不是用户停的）
+pub fn rec_cut_short(name: &str, actual_min: f64, expect_min: f64) -> String {
+    match lang() {
+        Lang::Zh => format!("{name} 提前中断：实录 {actual_min:.0} 分，预期 {expect_min:.0} 分"),
+        Lang::En => format!("{name} ended early: {actual_min:.0} min of {expect_min:.0} min"),
+    }
+}
+
+/// 写入心跳异常：进程活着但文件几乎没长
+pub fn rec_stalled(detail: &str) -> String {
+    match lang() {
+        Lang::Zh => format!("录像没有在写盘（{detail}），已重启该段"),
+        Lang::En => format!("Recording is not hitting the disk ({detail}), restarting"),
+    }
+}
+
 pub fn rec_finished(name: &str, mb: f64) -> String {
     match lang() {
         Lang::Zh => format!("录像结束 {name}（{mb:.0} MB）"),
@@ -824,6 +849,18 @@ const PAIRS: &[(&str, &str)] = &[
     ("数据栏", "Data bar"),
     ("网络速率", "Network rate"),
     ("内存占用", "Memory usage"),
+    ("启动与运行", "Startup & runtime"),
+    ("开机自启", "Start with Windows"),
+    ("进程守护", "Process watchdog"),
+    ("需先开启开机自启", "Needs startup enabled"),
+    ("启动后自动录像", "Start recording on launch"),
+    ("这一路没有画面，无法开始录像", "No picture on this channel — cannot start recording"),
+    ("无法定位程序路径，开机自启未生效", "Cannot resolve the executable path; startup entry not written"),
+    ("开机自启设置失败", "Failed to update the startup entry"),
+    ("开机自启写在当前用户的启动项里，不需要管理员权限", "Written to the current user's startup entries; no admin rights needed"),
+    ("登录 Windows 后自动运行本程序，不弹窗、不请求管理员权限", "Launches after you sign in — no window prompt, no admin request"),
+    ("由守护进程看住主程序：异常退出会立刻重新拉起；正常关窗口则一起退出", "A watchdog relaunches the app if it crashes; closing the window stops both"),
+    ("程序启动后自动开始录制所有已启用通道；画面未连上的通道会等它上线后再开录", "Records every enabled channel on launch; channels that are offline start once they come online"),
     ("录像启动失败", "Recording failed to start"),
     ("录像连续失败，已停止", "recording kept failing and was stopped"),
     ("录像结束", "Recording finished"),

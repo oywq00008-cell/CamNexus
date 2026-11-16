@@ -392,3 +392,130 @@ pub fn human_rate(bytes_per_sec: f64) -> String {
         format!("{:.1} MB/s", v / (1024.0 * 1024.0))
     }
 }
+
+// ---------------------------------------------------------------- 开机自启
+
+/// Run 键下的值名
+const RUN_NAME: &str = "CamNexus";
+
+#[cfg(windows)]
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 自启命令行：路径带空格必须加引号，否则 Run 项解析会断
+pub fn autostart_command(exe: &std::path::Path, guard: bool) -> String {
+    let p = exe.display().to_string();
+    if guard {
+        format!("\"{p}\" --guard")
+    } else {
+        format!("\"{p}\"")
+    }
+}
+
+/// 读回 Run 项当前值（没有则 None），用于判断是否与设置一致
+#[cfg(windows)]
+pub fn autostart_read() -> Option<String> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+        REG_SZ,
+    };
+
+    let sub = wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
+    let name = wide(RUN_NAME);
+    unsafe {
+        let mut hkey: HKEY = std::ptr::null_mut();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            sub.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut hkey,
+        ) != 0
+        {
+            return None;
+        }
+        let mut buf = vec![0u8; 1024];
+        let mut len = buf.len() as u32;
+        let mut ty = REG_SZ;
+        let rc = RegQueryValueExW(
+            hkey,
+            name.as_ptr(),
+            std::ptr::null(),
+            &mut ty,
+            buf.as_mut_ptr(),
+            &mut len,
+        );
+        RegCloseKey(hkey);
+        if rc != 0 {
+            return None;
+        }
+        let u16s: Vec<u16> = buf[..len as usize]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .take_while(|c| *c != 0)
+            .collect();
+        Some(String::from_utf16_lossy(&u16s))
+    }
+}
+
+#[cfg(not(windows))]
+pub fn autostart_read() -> Option<String> {
+    None
+}
+
+/// 写入/删除自启项。`on = false` 时删除。
+#[cfg(windows)]
+pub fn set_autostart(exe: &std::path::Path, guard: bool, on: bool) -> Result<(), String> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, RegCloseKey, RegCreateKeyExW, RegDeleteValueW,
+        RegSetValueExW, REG_SZ,
+    };
+
+    let sub = wide(r"Software\Microsoft\Windows\CurrentVersion\Run");
+    let name = wide(RUN_NAME);
+    unsafe {
+        let mut hkey: HKEY = std::ptr::null_mut();
+        let rc = RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            sub.as_ptr(),
+            0,
+            std::ptr::null(),
+            0,
+            KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut hkey,
+            std::ptr::null_mut(),
+        );
+        if rc != 0 {
+            return Err(format!("打开注册表失败（错误码 {rc}）"));
+        }
+        let out = if on {
+            let cmd = wide(&autostart_command(exe, guard));
+            let bytes = (cmd.len() * 2) as u32;
+            RegSetValueExW(
+                hkey,
+                name.as_ptr(),
+                0,
+                REG_SZ,
+                cmd.as_ptr() as *const u8,
+                bytes,
+            )
+        } else {
+            RegDeleteValueW(hkey, name.as_ptr())
+        };
+        RegCloseKey(hkey);
+        // 2 = 值不存在，删除时属正常
+        if out != 0 && !(out == 2 && !on) {
+            return Err(format!("写入注册表失败（错误码 {out}）"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+pub fn set_autostart(_exe: &std::path::Path, _guard: bool, _on: bool) -> Result<(), String> {
+    Err("当前系统不支持开机自启".into())
+}

@@ -23,6 +23,12 @@ use eframe::egui;
 fn main() -> eframe::Result<()> {
     // 控制台诊断模式：camnexus --probe rtsp://...
     let args: Vec<String> = std::env::args().collect();
+
+    // --guard 必须在最前面：守护进程不加载配置、不抢单实例锁，
+    // 否则它自己写下的 PID 会让它误判"已有实例"而立刻退出。
+    if args.iter().any(|a| a == "--guard") {
+        guard_loop();
+    }
     if let Some(pos) = args.iter().position(|a| a == "--probe") {
         if let Some(url) = args.get(pos + 1) {
             let r = discover::probe_url(url);
@@ -39,6 +45,22 @@ fn main() -> eframe::Result<()> {
     let cfg = config::AppConfig::load();
     // 语言必须在任何界面文案之前确定：i18n 的 tr() 全靠这个全局状态
     i18n::set_lang(cfg.lang);
+
+    // 单实例：开了开机自启之后，登录时可能已有实例在跑，
+    // 用户再双击图标就会起第二份——两套取流直接顶满相机连接数。
+    if !single_instance() {
+        return Ok(());
+    }
+
+    // 自启项自愈：程序被移动过、或注册表被清理过，这里补回来
+    if cfg.autostart
+        && let Ok(exe) = std::env::current_exe()
+    {
+        let want = sys::autostart_command(&exe, cfg.guard);
+        if sys::autostart_read().as_deref() != Some(want.as_str()) {
+            let _ = sys::set_autostart(&exe, cfg.guard, true);
+        }
+    }
     let open_diag = args.iter().any(|a| a == "--diag");
     // --detect-test <图片>：用 ffmpeg 解码后跑一次检测，打印结果（自检用）
     // --net-test：打印各网卡 2 秒内的收发速率，用于核对数据栏的读数
@@ -108,7 +130,7 @@ fn main() -> eframe::Result<()> {
         viewport,
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "CamNexus",
         options,
         Box::new(move |cc| {
@@ -154,7 +176,13 @@ fn main() -> eframe::Result<()> {
             }
             Ok(Box::new(app))
         }),
-    )
+    );
+
+    // 正常关闭窗口：给守护留个"别再拉我"的标记
+    if result.is_ok() {
+        let _ = std::fs::write(clean_exit_marker(), b"ok");
+    }
+    result
 }
 
 /// 从文件头读尺寸（支持 JPEG / PNG），比解析 ffmpeg 输出可靠
@@ -195,6 +223,122 @@ fn image_size(buf: &[u8]) -> Option<(usize, usize)> {
 }
 
 
+
+
+/// 单实例锁：把 PID 写进数据目录，启动前检查那个进程还在不在。
+///
+/// 比命名互斥体好排查：出问题直接看文件就知道上次是谁占着。
+/// 进程被杀后 PID 文件会残留，所以必须校验进程是否真的还活着。
+#[cfg(windows)]
+fn instance_pid_path() -> std::path::PathBuf {
+    config::data_dir().join("instance.pid")
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(h, &mut code);
+        CloseHandle(h);
+        ok != 0 && code == STILL_ACTIVE as u32
+    }
+}
+
+/// 有没有 CamNexus 正在运行
+#[cfg(windows)]
+fn instance_running() -> bool {
+    let Ok(s) = std::fs::read_to_string(instance_pid_path()) else {
+        return false;
+    };
+    let Ok(pid) = s.trim().parse::<u32>() else {
+        return false;
+    };
+    pid != 0 && process_alive(pid)
+}
+
+#[cfg(not(windows))]
+fn instance_running() -> bool {
+    false
+}
+
+/// 抢占单实例锁。false 表示已有实例在跑。
+#[cfg(windows)]
+fn single_instance() -> bool {
+    if instance_running() {
+        return false;
+    }
+    let _ = std::fs::create_dir_all(config::data_dir());
+    let _ = std::fs::write(instance_pid_path(), std::process::id().to_string());
+    true
+}
+
+#[cfg(not(windows))]
+fn single_instance() -> bool {
+    true
+}
+
+/// 正常退出的标记文件。主程序正常关闭窗口时写它，守护据此判断是"用户关的"
+/// 还是"崩溃了"——否则每次关窗口都会被守护重新拉起来。
+pub fn clean_exit_marker() -> std::path::PathBuf {
+    config::data_dir().join("clean_exit")
+}
+
+/// 守护模式：主程序退出后决定是否重启。
+fn guard_loop() -> ! {
+    use std::time::{Duration, Instant};
+
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("camnexus.exe"));
+    let marker = clean_exit_marker();
+    let mut fast_exits = 0u32;
+
+    loop {
+        // 已有实例在跑就别插手，否则每 3 秒拉一个抢不到锁的进程
+        if instance_running() {
+            std::process::exit(0);
+        }
+        let _ = std::fs::remove_file(&marker);
+        let started = Instant::now();
+        let status = std::process::Command::new(&exe)
+            .env("CAMNEXUS_GUARDED", "1")
+            .spawn()
+            .and_then(|mut c| c.wait());
+
+        // 正常退出：守护也退出
+        if marker.exists() {
+            let _ = std::fs::remove_file(&marker);
+            std::process::exit(0);
+        }
+
+        let ran = started.elapsed();
+        if ran < Duration::from_secs(15) {
+            // 秒退：多半是启动即崩，别在几秒内刷几十次
+            fast_exits += 1;
+        } else {
+            fast_exits = 0;
+        }
+
+        let wait = if fast_exits >= 5 {
+            fast_exits = 0;
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(3)
+        };
+        if let Err(e) = status {
+            eprintln!("守护：拉起主程序失败 {e}");
+        }
+        std::thread::sleep(wait);
+    }
+}
+
 /// 自检：把每个网络接口的实际速率打出来，用来核对数据栏读数。
 fn net_test() {
     use std::time::Duration;
@@ -203,7 +347,7 @@ fn net_test() {
     std::thread::sleep(Duration::from_secs(2));
     let b = sys::net_ifaces();
 
-    println!("{:<34} {:>12} {:>12}  {}", "网卡", "下行", "上行", "计入");
+    println!("{:<34} {:>12} {:>12}  计入", "网卡", "下行", "上行");
     let mut tot_dn = 0.0;
     let mut tot_up = 0.0;
     for (name, in0, out0, counted) in &a {
@@ -256,6 +400,7 @@ fn audio_test(idx1: usize) {
         tcp: cfg.tcp,
         hwdec: cfg.hwdec.clone(),
         audio: true,
+        start_delay: std::time::Duration::ZERO,
     });
 
     let started = Instant::now();

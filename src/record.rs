@@ -24,8 +24,21 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 /// 必须持续读取：管道写满会让 ffmpeg 卡死。
 const ERR_KEEP: usize = 24;
 
-/// 连续失败后的重试间隔（秒），按失败次数取，最多到最后一档
+/// 配置类错误（认证失败、地址错、缺编码器）的重试间隔：重试也没用，几秒后放弃
 const RETRY_BACKOFF: [u64; 3] = [1, 2, 4];
+
+/// 网络类错误的重试间隔上限。相机断电、交换机重启、WiFi 掉线都属于这一类，
+/// 必须一直重试到网络恢复，不能因为连续失败就彻底停录。
+const RETRY_MAX_SECS: u64 = 30;
+
+/// 段间留出的间隔：给相机释放上一个 RTSP 会话的时间
+const SEGMENT_GAP_MS: u64 = 300;
+
+/// 段开始多久后检查一次写入进展
+const HEARTBEAT_AFTER: Duration = Duration::from_secs(60);
+
+/// 心跳检查时文件至少应该有这么大，否则判定为"录了个空文件"
+const HEARTBEAT_MIN_BYTES: u64 = 200 * 1024;
 
 /// Windows 作业对象：主程序退出（含被强杀）时，作业关闭 → 里面的 ffmpeg 一并终止。
 /// 没有它，主程序被结束进程后会留下孤儿 ffmpeg 继续往文件里写。
@@ -89,9 +102,24 @@ struct Recorder {
     stop_deadline: Option<Instant>,
     /// ffmpeg 的 stderr 尾部（后台线程持续写入）
     errbuf: Arc<Mutex<VecDeque<String>>>,
+    started_at: Instant,
+    /// 本段预期时长（到下一个整点的秒数），用于判断是"到点结束"还是"中途断"
+    expect_secs: u32,
+    /// 写入心跳是否已检查过
+    heartbeat_done: bool,
 }
 
 impl Recorder {
+    /// 本段实际录了多久（秒）
+    fn elapsed_secs(&self) -> f64 {
+        self.started_at.elapsed().as_secs_f64()
+    }
+
+    /// 当前文件大小
+    fn size(&self) -> u64 {
+        std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
+    }
+
     /// 取 ffmpeg 最后几行报错，拼成一行给日志用
     fn stderr_tail(&self) -> String {
         let Ok(g) = self.errbuf.lock() else {
@@ -214,8 +242,14 @@ impl RecordManager {
 
     /// 退出程序时调用：全部请求停止并等待收尾
     pub fn shutdown(&mut self) {
+        self.shutdown_within(STOP_GRACE);
+    }
+
+    /// 同上，但可以指定最长等待。重建流时用它，
+    /// 等太久会把界面卡住，等太短又会让新旧会话叠加。
+    pub fn shutdown_within(&mut self, cap: Duration) {
         self.stop_all_async();
-        let deadline = Instant::now() + STOP_GRACE;
+        let deadline = Instant::now() + cap;
         loop {
             let mut pending = false;
             for slot in self.slots.values_mut() {
@@ -234,9 +268,28 @@ impl RecordManager {
         }
     }
 
+    /// 自动录像：把指定通道全部置为"要录"。
+    /// 真正开录还要等画面在线（见 tick 里的 online 判断）。
+    pub fn want_all(&mut self, idxs: &[usize]) {
+        for &i in idxs {
+            let slot = self.slots.entry(i).or_insert(Slot {
+                want: false,
+                rec: None,
+                fails: 0,
+                retry_at: None,
+            });
+            if !slot.want {
+                slot.want = true;
+                slot.fails = 0;
+                slot.retry_at = None;
+            }
+        }
+    }
+
     /// 带缓存的目录占用（设置面板每帧都会问，不能真每帧都扫盘）
     pub fn dir_size_cached(&mut self, root: &Path) -> u64 {
-        const TTL: Duration = Duration::from_secs(3);
+        // 录像目录可能有几千个文件，全量遍历不能太频繁
+        const TTL: Duration = Duration::from_secs(30);
         if let Some((t, v)) = self.size_cache
             && t.elapsed() < TTL {
                 return v;
@@ -247,7 +300,9 @@ impl RecordManager {
     }
 
     /// 每帧驱动：启停、整点分段、容量清理
-    pub fn tick(&mut self, ffmpeg: &Path, cfg: &AppConfig, channels: &[Channel]) {
+    /// `online[i]` 表示第 i 路的画面是否在线。只有在线才开录——
+    /// 否则相机没连上时会白白消耗三次失败名额，还会留下空文件。
+    pub fn tick(&mut self, ffmpeg: &Path, cfg: &AppConfig, channels: &[Channel], online: &[bool]) {
         let root = record_root(cfg);
 
         // 通道被删除/重排后，超出的旧槽位不再有效，直接停掉，避免张冠李戴
@@ -275,28 +330,82 @@ impl RecordManager {
             });
 
             if let Some(r) = slot.rec.as_mut() {
+                // 写入心跳：进程活着不代表在写盘（磁盘满、文件被占用时最典型）
+                if !r.heartbeat_done && r.started_at.elapsed() > HEARTBEAT_AFTER {
+                    r.heartbeat_done = true;
+                    let size = r.size();
+                    if size < HEARTBEAT_MIN_BYTES {
+                        let detail = format!(
+                            "{} 秒内只写入 {} KB",
+                            HEARTBEAT_AFTER.as_secs(),
+                            size / 1024
+                        );
+                        logs::append(&ch.name, &i18n::rec_stalled(&detail));
+                        let _ = r.child.kill();
+                    }
+                }
+
                 if r.poll() {
-                    // 本段结束（到点或被停止）
-                    let size = std::fs::metadata(&r.path).map(|m| m.len()).unwrap_or(0);
+                    // 本段结束（到点、被停止、或中途断了）
+                    let size = r.size();
                     let name = r.path.file_name().unwrap_or_default().to_string_lossy();
+                    let detail = r.stderr_tail();
+                    let actual = r.elapsed_secs();
+                    let expect = r.expect_secs as f64;
+                    // 用户主动停止时 want 已被清掉，不算异常
+                    let user_stop = !slot.want;
+                    let cut_short = actual < expect * 0.9;
+
                     if size < 64 * 1024 {
-                        // 秒退：地址不通、编码器缺失、参数错误……不能无限重试
+                        // 秒退：连一帧都没写进去
                         let _ = std::fs::remove_file(&r.path);
                         slot.fails = slot.fails.saturating_add(1);
-                        let detail = r.stderr_tail();
-                        logs::append(&ch.name, &i18n::rec_fail_detail(slot.fails, &detail));
-                        // 退避：避免同一秒内把三次机会烧完
-                        let idx = (slot.fails as usize - 1).min(RETRY_BACKOFF.len() - 1);
-                        let wait = RETRY_BACKOFF[idx];
-                        slot.retry_at = Some(Instant::now() + Duration::from_secs(wait));
-                        if slot.fails >= 3 {
-                            slot.want = false;
-                            slot.fails = 0;
-                            self.last_error = Some(i18n::rec_gave_up(&ch.name));
+                        let config_err = is_config_error(&detail);
+                        if config_err {
+                            // 认证失败、地址错、缺编码器：重试没有意义
+                            let idx =
+                                (slot.fails as usize - 1).min(RETRY_BACKOFF.len() - 1);
+                            let wait = RETRY_BACKOFF[idx];
+                            slot.retry_at =
+                                Some(Instant::now() + Duration::from_secs(wait));
+                            logs::append(
+                                &ch.name,
+                                &i18n::rec_fail_detail(slot.fails, &detail),
+                            );
+                            if slot.fails >= 3 {
+                                slot.want = false;
+                                slot.fails = 0;
+                                self.last_error = Some(i18n::rec_gave_up(&ch.name));
+                            }
+                        } else {
+                            // 网络类：一直重试到恢复，间隔封顶 30 秒
+                            let shift = (slot.fails - 1).min(5) as u32;
+                            let wait = (1u64 << shift).min(RETRY_MAX_SECS);
+                            slot.retry_at =
+                                Some(Instant::now() + Duration::from_secs(wait));
+                            logs::append(
+                                &ch.name,
+                                &i18n::rec_fail_retry(slot.fails, wait, &detail),
+                            );
                         }
+                    } else if !user_stop && cut_short {
+                        // 有画面但提前断了：多半是中途断网
+                        slot.fails = 0;
+                        logs::append(
+                            &ch.name,
+                            &i18n::rec_cut_short(&name, actual / 60.0, expect / 60.0),
+                        );
+                        slot.retry_at =
+                            Some(Instant::now() + Duration::from_millis(SEGMENT_GAP_MS));
                     } else {
                         slot.fails = 0;
-                        logs::append(&ch.name, &i18n::rec_finished(&name, size as f64 / 1_048_576.0));
+                        logs::append(
+                            &ch.name,
+                            &i18n::rec_finished(&name, size as f64 / 1_048_576.0),
+                        );
+                        // 到点切换：留一点时间让相机释放上一个会话
+                        slot.retry_at =
+                            Some(Instant::now() + Duration::from_millis(SEGMENT_GAP_MS));
                     }
                     slot.rec = None;
                     self.size_cache = None;
@@ -309,7 +418,9 @@ impl RecordManager {
             }
 
             let backoff_done = slot.retry_at.map(|t| Instant::now() >= t).unwrap_or(true);
-            if slot.want && slot.rec.is_none() && backoff_done {
+            // 不在线就不录：等画面恢复再开始，避免空录和浪费重试次数
+            let is_online = online.get(idx).copied().unwrap_or(false);
+            if slot.want && slot.rec.is_none() && backoff_done && is_online {
                 #[cfg(windows)]
                 let spawned = spawn_segment(ffmpeg, cfg, channels, idx, &root, self.job.as_ref());
                 #[cfg(not(windows))]
@@ -422,6 +533,28 @@ fn sanitize(name: &str) -> String {
 }
 
 /// 计算本段时长与结束时间（对齐整点）
+/// 判断这个报错是"配置错了"还是"网络不通"。
+///
+/// 配置错误重试多少次都一样，早点放弃省得刷日志；
+/// 网络类必须一直重试，相机断电、WiFi 掉线都要能自己回来。
+fn is_config_error(detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    [
+        "401",
+        "403",
+        "404",
+        "unauthorized",
+        "forbidden",
+        "not found",
+        "unknown encoder",
+        "encoder not found",
+        "no such file",
+        "invalid argument",
+    ]
+    .iter()
+    .any(|k| d.contains(k))
+}
+
 fn segment_plan() -> (u32, String) {
     let (_, _, _, h, mi, s) = crate::sys::local_now();
     // 到下一个整点还有多少秒
@@ -469,14 +602,15 @@ fn spawn_segment_inner(
     #[cfg(windows)] job: Option<&JobGuard>,
 ) -> Result<Recorder, String> {
     let ch = &channels[idx];
-    let (y, mo, d, h, mi, _) = crate::sys::local_now();
+    let (y, mo, d, h, mi, s) = crate::sys::local_now();
     let date = format!("{y:04}-{mo:02}-{d:02}");
 
     let (secs, end_hm) = segment_plan();
     let dir = root.join(&date).join(channel_folder(channels, idx));
     std::fs::create_dir_all(&dir).map_err(|e| i18n::err(tr("创建录像目录失败"), e))?;
 
-    let path = dir.join(format!("{date} {h:02}-{mi:02}_{end_hm}.mp4"));
+    // 秒也要带上：失败重试落在同一分钟内时，只到分钟会撞名被 -y 覆盖
+    let path = dir.join(format!("{date} {h:02}-{mi:02}-{s:02}_{end_hm}.mp4"));
 
     // 分辨率：0 = 跟随送显
     let (mut w, mut hgt) = if ch.record.width > 0 && ch.record.height > 0 {
@@ -599,6 +733,9 @@ fn spawn_segment_inner(
         path,
         stop_deadline: None,
         errbuf,
+        started_at: Instant::now(),
+        expect_secs: secs,
+        heartbeat_done: false,
     })
 }
 

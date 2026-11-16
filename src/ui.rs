@@ -156,6 +156,8 @@ pub struct CamNexusApp {
     net_up: f64,
     /// 物理内存占用（%）
     mem_pct: f32,
+    /// 每路画面是否在线（约每秒刷新一次），录像只在在线的通道上启动
+    online_mask: Vec<bool>,
     last_sample: Instant,
     upload_ms: std::collections::HashMap<usize, f32>,
     show_details: bool,
@@ -861,6 +863,7 @@ impl CamNexusApp {
             net_down: 0.0,
             net_up: 0.0,
             mem_pct: 0.0,
+            online_mask: Vec::new(),
             last_sample: Instant::now(),
             upload_ms: Default::default(),
             show_details: false,
@@ -1109,8 +1112,10 @@ impl CamNexusApp {
 
     fn rebuild_streams(&mut self) {
         self.stop_audio();
-        // 通道可能被删除或重排，录制槽位按索引对应，必须跟着停
-        self.records.stop_all_async();
+        // 通道可能被删除或重排，录制槽位按索引对应，必须跟着停。
+        // 这里要**等**它退出：旧的录像会话还占着相机额度，
+        // 如果立刻起新流，同一台相机上会瞬间超限，表现为新流随机几路连不上。
+        self.records.shutdown_within(Duration::from_millis(900));
         self.active_sig = stream_sig(&self.cfg);
         self.streams.clear();
         self.textures.clear();
@@ -1124,10 +1129,31 @@ impl CamNexusApp {
             self.streams = self.cfg.channels.iter().map(|_| None).collect();
             return;
         }
-        let fresh: Vec<Option<Stream>> = (0..self.cfg.channels.len())
-            .map(|i| self.spawn_one(i))
-            .collect();
+        // 错峰建连：同时拉起 6 个 ffmpeg 会让启动瞬间的 CPU 和相机压力都很尖。
+        // 延迟放在取流线程里（而不是在这里 sleep），界面不会被卡住。
+        let mut fresh: Vec<Option<Stream>> = Vec::with_capacity(self.cfg.channels.len());
+        for i in 0..self.cfg.channels.len() {
+            let delay = if i == 0 {
+                Duration::ZERO
+            } else {
+                Duration::from_millis(120 * i as u64)
+            };
+            fresh.push(self.spawn_one_delayed(i, delay));
+        }
         self.streams = fresh;
+
+        // 自动录像：只有开了这个开关才动录制状态；实际开录还要等画面在线
+        if self.cfg.auto_record {
+            let idxs: Vec<usize> = self
+                .cfg
+                .channels
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c.enabled && !c.url.trim().is_empty())
+                .map(|(i, _)| i)
+                .collect();
+            self.records.want_all(&idxs);
+        }
     }
 
     fn toast(&mut self, msg: impl Into<String>) {
@@ -2042,6 +2068,10 @@ impl CamNexusApp {
 
     /// 按索引启动单路取流（rebuild_streams 与单路重连共用）
     fn spawn_one(&self, idx: usize) -> Option<Stream> {
+        self.spawn_one_delayed(idx, Duration::ZERO)
+    }
+
+    fn spawn_one_delayed(&self, idx: usize, delay: Duration) -> Option<Stream> {
         let c = self.cfg.channels.get(idx)?;
         if !c.enabled || c.url.trim().is_empty() {
             return None;
@@ -2058,6 +2088,7 @@ impl CamNexusApp {
             hwdec: self.cfg.hwdec.clone(),
             // 音频与画面共用同一条 RTSP 会话，省掉单独一路连接
             audio: true,
+            start_delay: delay,
         }))
     }
 
@@ -2440,8 +2471,22 @@ impl CamNexusApp {
             p.image(self.icons.record.id(), rec_rect, uv, tint);
         }
         if resp_rec.clicked() {
-            let on = self.records.toggle(idx);
-            logs::append(&name, if on { tr("开始录制（手动）") } else { tr("停止录制（手动）") });
+            let was_on = self.records.is_recording(idx);
+            // 不在线时不允许开始：录出来只会是空文件，还会白烧重试次数
+            let online = self.online_mask.get(idx).copied().unwrap_or(false);
+            if !was_on && !online {
+                self.toast(tr("这一路没有画面，无法开始录像"));
+            } else {
+                let on = self.records.toggle(idx);
+                logs::append(
+                    &name,
+                    if on {
+                        tr("开始录制（手动）")
+                    } else {
+                        tr("停止录制（手动）")
+                    },
+                );
+            }
         }
 
         // 音频开关（同一时刻只允许一路）：右下角图标，透明底
@@ -2836,6 +2881,8 @@ impl CamNexusApp {
             }
             apply_style(ctx, self.cfg.dark);
             let saved = self.cfg.save();
+            // 自启项跟着设置走：改了就在这里落注册表
+            let auto_err = self.sync_autostart();
             self.show_settings = false;
 
             if save_reconnect {
@@ -2849,7 +2896,10 @@ impl CamNexusApp {
                     Ok(_) if need_reconnect => self.toast(
                         tr("已保存。通道/解码改动需点右上角「重连以应用改动」才生效"),
                     ),
-                    Ok(_) => self.toast(tr("设置已保存")),
+                    Ok(_) => match auto_err {
+                        Some(e) => self.toast(e),
+                        None => self.toast(tr("设置已保存")),
+                    },
                     Err(e) => self.toast(i18n::err(tr("保存失败"), e)),
                 }
             }
@@ -3567,6 +3617,30 @@ impl CamNexusApp {
     }
 
     /// ⑤ 通用：外观、提示、诊断、FFmpeg
+    /// 把「开机自启」设置同步到注册表 Run 项。
+    /// 返回 Some(提示文案) 表示失败，需要告知用户。
+    fn sync_autostart(&self) -> Option<String> {
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(_) => return Some(tr("无法定位程序路径，开机自启未生效").to_string()),
+        };
+        // 守护开关只有在自启开启时才有意义
+        let guard = self.cfg.autostart && self.cfg.guard;
+        let want = if self.cfg.autostart {
+            Some(crate::sys::autostart_command(&exe, guard))
+        } else {
+            None
+        };
+        // 已经一致就不用动注册表
+        if crate::sys::autostart_read() == want {
+            return None;
+        }
+        match crate::sys::set_autostart(&exe, guard, self.cfg.autostart) {
+            Ok(()) => None,
+            Err(e) => Some(i18n::err(tr("开机自启设置失败"), e)),
+        }
+    }
+
     fn set_tab_general(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let p = self.pal();
 
@@ -3604,6 +3678,60 @@ impl CamNexusApp {
         ui.add_space(6.0);
         if ui.button(tr("查看运行状态详情")).clicked() {
             self.show_details = true;
+        }
+
+        ui.add_space(14.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(tr("启动与运行")).strong());
+            help(
+                ui,
+                tr("开机自启写在当前用户的启动项里，不需要管理员权限"),
+            );
+        });
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.draft.autostart, tr("开机自启"));
+            help(
+                ui,
+                tr("登录 Windows 后自动运行本程序，不弹窗、不请求管理员权限"),
+            );
+        });
+
+        // 守护必须跟着自启走：只开守护不开自启，重开机后没有任何东西去拉起它
+        ui.horizontal(|ui| {
+            let on = self.draft.autostart;
+            ui.add_enabled_ui(on, |ui| {
+                ui.checkbox(&mut self.draft.guard, tr("进程守护"));
+            });
+            if on {
+                help(
+                    ui,
+                    tr("由守护进程看住主程序：异常退出会立刻重新拉起；正常关窗口则一起退出"),
+                );
+            } else {
+                ui.label(
+                    egui::RichText::new(tr("需先开启开机自启"))
+                        .size(11.0)
+                        .color(p.muted),
+                );
+            }
+        });
+
+        // 这一项只在开启自启后出现：避免"勾了但永远用不上"的困惑
+        if self.draft.autostart {
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.draft.auto_record, tr("启动后自动录像"));
+                help(
+                    ui,
+                    tr("程序启动后自动开始录制所有已启用通道；画面未连上的通道会等它上线后再开录"),
+                );
+            });
+        } else if self.draft.auto_record {
+            // 关掉自启时把自动录像一起关掉，避免留下一个不生效的设置
+            self.draft.auto_record = false;
         }
 
         ui.add_space(14.0);
@@ -3824,6 +3952,16 @@ impl CamNexusApp {
         let sys_cpu = self.sys_cpu.sample();
 
         // 数据栏用的整机指标
+        self.online_mask = self
+            .streams
+            .iter()
+            .map(|s| {
+                s.as_ref()
+                    .map(|x| x.status().state == State::Live)
+                    .unwrap_or(false)
+            })
+            .collect();
+
         let (dn, up) = self.net.sample();
         self.net_down = dn;
         self.net_up = up;
@@ -4224,7 +4362,9 @@ impl eframe::App for CamNexusApp {
             self.toast(i18n::detect_unavailable(&e));
         }
         if let Some(ff) = self.ffmpeg.clone() {
-            self.records.tick(&ff, &self.cfg, &self.cfg.channels);
+            let mask = self.online_mask.clone();
+            self.records
+                .tick(&ff, &self.cfg, &self.cfg.channels, &mask);
         }
         self.poll_scan();
         // 裁剪黑边：每 2 秒检测一次，连续两次一致才生效

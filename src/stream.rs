@@ -64,6 +64,9 @@ pub struct StreamCfg {
     pub hwdec: String,
     /// 是否让这条流顺带产出音频（省掉单独一路 RTSP 会话）
     pub audio: bool,
+    /// 启动前等这么久再建连。多路同时拉起会给相机和 CPU 造成尖峰，
+    /// 错开一点，界面也不用为此阻塞。
+    pub start_delay: Duration,
 }
 
 /// 多久没收到帧就判定「卡住」。
@@ -324,6 +327,11 @@ fn run_loop(
 ) {
     let frame_len = (cfg.width as usize) * (cfg.height as usize) * 3;
 
+    // 错峰建连：延迟放在取流线程里，不阻塞界面
+    if !cfg.start_delay.is_zero() && !sleep_stop(cfg.start_delay, &stop) {
+        return;
+    }
+
     // 只探测一次：SDP 里有没有 m=audio。
     // 注意该型号的 SDP 里 m=audio 的端口字段恒为 0，不能拿端口判断可用性。
     let mut want_audio = cfg.audio && crate::discover::stream_has_audio(&cfg.url).unwrap_or(false);
@@ -411,6 +419,38 @@ fn run_loop(
             });
         }
 
+        // 首帧看门狗：ffmpeg 有时会"连着但不吐数据"，
+        // 这种状态既不退出也不出错，光靠 -timeout 不一定兜得住。
+        let got_first = Arc::new(AtomicBool::new(false));
+        let child_pid = child.id();
+        {
+            let flag = got_first.clone();
+            let slot = child_slot.clone();
+            let sp = stop.clone();
+            std::thread::Builder::new()
+                .name("first-frame".into())
+                .spawn(move || {
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    while Instant::now() < deadline {
+                        if sp.load(Ordering::SeqCst) || flag.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    if flag.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    // 只杀自己那一个：期间可能已经重连过，别误伤新进程
+                    if let Ok(mut g) = slot.lock()
+                        && let Some(c) = g.as_mut()
+                        && c.id() == child_pid
+                    {
+                        let _ = c.kill();
+                    }
+                })
+                .ok();
+        }
+
         if let Ok(mut slot) = child_slot.lock() {
             *slot = Some(child);
         }
@@ -458,6 +498,7 @@ fn run_loop(
             }
             last_arrival = Some(arrived);
             got_any = true;
+            got_first.store(true, Ordering::SeqCst);
             seq += 1;
 
             let frame = Frame {
