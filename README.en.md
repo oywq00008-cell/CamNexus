@@ -28,7 +28,7 @@ The goal is simple: **turn an old PC into a surveillance recorder**. That's why 
 - **Auto layout** — tidy scattered views into an even grid
 - **Single-channel fullscreen** — double-click or use the right-click menu
 - **Sub-stream support** — main stream for big views, sub-stream for small ones
-- **Audio** — enable sound for any individual channel
+- **Audio** — enable sound for any individual channel; it rides on the same connection as the picture, so it costs no extra camera session
 - **Hardware decoding** — CUDA / D3D11VA / QSV / AMF, handing decoding to the GPU
 
 ### Recording & playback
@@ -166,6 +166,10 @@ Got a spare Android phone? Install [CamNexusRTSP](https://github.com/oywq00008-c
 ---
 
 ## FAQ
+
+**No sound?**
+
+Run `camnexus.exe --audio-test 1` (the number is the channel index). It reports whether the channel carries an audio track and whether samples actually arrive — enough to tell "this camera has no microphone" apart from "the stream failed".
 
 **A camera won't connect.**
 
