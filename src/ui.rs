@@ -2174,7 +2174,7 @@ impl CamNexusApp {
 
         // 录制开关：喇叭左边。白=未录，红=录制中
         let rec_on = self.records.is_recording(idx);
-        let rec_size = 24.0;
+        let rec_size = 22.0;
         // 被全屏按钮压住时整排左移；此时纵向也对齐到按钮中心
         let shift = self.fs_row_shift(rect);
         let pad = if shift > 0.0 { 8.0 + shift } else { 8.0 };
