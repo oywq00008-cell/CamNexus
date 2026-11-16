@@ -7,10 +7,11 @@
 //! - 容量上限按「整文件」删除最早的文件，循环腾空间。
 
 use crate::i18n::{self, tr};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::config::{AppConfig, Channel, RecCodec};
@@ -18,6 +19,13 @@ use crate::logs;
 
 /// 停止宽限期：超过就强杀，避免界面卡住
 const STOP_GRACE: Duration = Duration::from_secs(5);
+
+/// 保留多少行 ffmpeg stderr 用于失败诊断。
+/// 必须持续读取：管道写满会让 ffmpeg 卡死。
+const ERR_KEEP: usize = 24;
+
+/// 连续失败后的重试间隔（秒），按失败次数取，最多到最后一档
+const RETRY_BACKOFF: [u64; 3] = [1, 2, 4];
 
 /// Windows 作业对象：主程序退出（含被强杀）时，作业关闭 → 里面的 ffmpeg 一并终止。
 /// 没有它，主程序被结束进程后会留下孤儿 ffmpeg 继续往文件里写。
@@ -79,9 +87,33 @@ struct Recorder {
     child: Child,
     path: PathBuf,
     stop_deadline: Option<Instant>,
+    /// ffmpeg 的 stderr 尾部（后台线程持续写入）
+    errbuf: Arc<Mutex<VecDeque<String>>>,
 }
 
 impl Recorder {
+    /// 取 ffmpeg 最后几行报错，拼成一行给日志用
+    fn stderr_tail(&self) -> String {
+        let Ok(g) = self.errbuf.lock() else {
+            return String::new();
+        };
+        if g.is_empty() {
+            return String::new();
+        }
+        // 只取最后 3 行：ffmpeg 报错前几行多是上下文，最后几行才是原因
+        let tail: Vec<&str> = g
+            .iter()
+            .rev()
+            .take(3)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        tail.join(" | ")
+    }
+
     /// 请求优雅停止：写 `q` 让 ffmpeg 写完 moov
     fn request_stop(&mut self) {
         if self.stop_deadline.is_some() {
@@ -117,6 +149,8 @@ struct Slot {
     rec: Option<Recorder>,
     /// 连续失败次数：防止 ffmpeg 秒退时每帧重试
     fails: u8,
+    /// 退避到期时间：到点前不再尝试启动
+    retry_at: Option<Instant>,
 }
 
 pub struct RecordManager {
@@ -157,9 +191,12 @@ impl RecordManager {
             want: false,
             rec: None,
             fails: 0,
+            retry_at: None,
         });
         if !slot.want {
+            // 用户主动开启：清掉失败计数与退避，立刻重试
             slot.fails = 0;
+            slot.retry_at = None;
         }
         slot.want = !slot.want;
         slot.want
@@ -234,6 +271,7 @@ impl RecordManager {
                 want: false,
                 rec: None,
                 fails: 0,
+                retry_at: None,
             });
 
             if let Some(r) = slot.rec.as_mut() {
@@ -245,10 +283,12 @@ impl RecordManager {
                         // 秒退：地址不通、编码器缺失、参数错误……不能无限重试
                         let _ = std::fs::remove_file(&r.path);
                         slot.fails = slot.fails.saturating_add(1);
-                        logs::append(
-                            &ch.name,
-                            &i18n::rec_fail_n(slot.fails),
-                        );
+                        let detail = r.stderr_tail();
+                        logs::append(&ch.name, &i18n::rec_fail_detail(slot.fails, &detail));
+                        // 退避：避免同一秒内把三次机会烧完
+                        let idx = (slot.fails as usize - 1).min(RETRY_BACKOFF.len() - 1);
+                        let wait = RETRY_BACKOFF[idx];
+                        slot.retry_at = Some(Instant::now() + Duration::from_secs(wait));
                         if slot.fails >= 3 {
                             slot.want = false;
                             slot.fails = 0;
@@ -268,7 +308,8 @@ impl RecordManager {
                 }
             }
 
-            if slot.want && slot.rec.is_none() {
+            let backoff_done = slot.retry_at.map(|t| Instant::now() >= t).unwrap_or(true);
+            if slot.want && slot.rec.is_none() && backoff_done {
                 #[cfg(windows)]
                 let spawned = spawn_segment(ffmpeg, cfg, channels, idx, &root, self.job.as_ref());
                 #[cfg(not(windows))]
@@ -286,6 +327,7 @@ impl RecordManager {
                             ),
                         );
                         slot.rec = Some(rec);
+                        slot.retry_at = None;
                         self.last_error = None;
                     }
                     Err(e) => {
@@ -514,7 +556,8 @@ fn spawn_segment_inner(
         .arg(&path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        // stderr 必须读走：管道写满会卡住 ffmpeg；它也是失败诊断的唯一线索
+        .stderr(Stdio::piped());
 
     #[cfg(windows)]
     {
@@ -523,15 +566,39 @@ fn spawn_segment_inner(
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let child = cmd.spawn().map_err(|e| i18n::err(tr("启动 ffmpeg 失败"), e))?;
+    let mut child = cmd.spawn().map_err(|e| i18n::err(tr("启动 ffmpeg 失败"), e))?;
     #[cfg(windows)]
     if let Some(job) = job {
         job.assign(&child);
     }
+
+    // 持续读走 stderr，只保留尾部若干行
+    let errbuf: Arc<Mutex<VecDeque<String>>> = Arc::default();
+    if let Some(se) = child.stderr.take() {
+        let buf = errbuf.clone();
+        let _ = std::thread::Builder::new()
+            .name("rec-stderr".into())
+            .spawn(move || {
+                use std::io::{BufRead, BufReader};
+                for line in BufReader::new(se).lines().map_while(Result::ok) {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    if let Ok(mut g) = buf.lock() {
+                        if g.len() >= ERR_KEEP {
+                            g.pop_front();
+                        }
+                        g.push_back(line);
+                    }
+                }
+            });
+    }
+
     Ok(Recorder {
         child,
         path,
         stop_deadline: None,
+        errbuf,
     })
 }
 

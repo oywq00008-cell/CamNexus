@@ -453,12 +453,18 @@ pub fn wrong_credentials(detail: &str) -> String {
     }
 }
 
-pub fn rec_fail_n(n: impl std::fmt::Display) -> String {
+/// 录像启动失败，附带 ffmpeg 的真实报错（没有报错时退化成原来的提示）
+pub fn rec_fail_detail(n: impl std::fmt::Display, detail: &str) -> String {
+    let d = detail.trim();
+    if d.is_empty() {
+        return match lang() {
+            Lang::Zh => format!("录像启动失败（第 {n} 次），ffmpeg 没有输出错误信息"),
+            Lang::En => format!("Recording failed to start (attempt {n}), ffmpeg printed nothing"),
+        };
+    }
     match lang() {
-        Lang::Zh => format!("录像启动失败（第 {n} 次），请检查地址或 ffmpeg 是否带对应编码器"),
-        Lang::En => format!(
-            "Recording failed to start (attempt {n}) — check the URL, or whether this ffmpeg build has the encoder"
-        ),
+        Lang::Zh => format!("录像启动失败（第 {n} 次）：{d}"),
+        Lang::En => format!("Recording failed to start (attempt {n}): {d}"),
     }
 }
 
