@@ -1,7 +1,9 @@
 //! 单路视频流：FFmpeg 子进程解码 → rawvideo 管道 → 最新帧
 
 use crate::i18n::{self, tr};
+use crate::audio::AudioBuf;
 use std::io::Read;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,6 +62,8 @@ pub struct StreamCfg {
     pub tcp: bool,
     /// 硬件解码后端名（"none" / "cuda" / "d3d11va" …），空或 none 表示软解
     pub hwdec: String,
+    /// 是否让这条流顺带产出音频（省掉单独一路 RTSP 会话）
+    pub audio: bool,
 }
 
 /// 多久没收到帧就判定「卡住」。
@@ -85,6 +89,10 @@ fn safe_tag(url: &str) -> String {
 
 pub struct Stream {
     shared: Arc<Mutex<Option<Frame>>>,
+    /// 音频缓冲（所有重连共用同一份，播放器不用跟着断）
+    audio: AudioBuf,
+    /// SDP 是否声明了音轨；探测失败或没有音轨时为 false
+    audio_ok: Arc<AtomicBool>,
     status: Arc<Mutex<Status>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -95,6 +103,8 @@ pub struct Stream {
 impl Stream {
     pub fn spawn(cfg: StreamCfg) -> Self {
         let shared = Arc::new(Mutex::new(None));
+        let audio = AudioBuf::default();
+        let audio_ok = Arc::new(AtomicBool::new(false));
         let status = Arc::new(Mutex::new(Status::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
@@ -105,14 +115,17 @@ impl Stream {
             stop.clone(),
             child.clone(),
         );
+        let (au, aok) = (audio.clone(), audio_ok.clone());
         let c = cfg.clone();
         let thread = std::thread::Builder::new()
             .name(format!("stream {}", safe_tag(&cfg.url)))
-            .spawn(move || run_loop(c, s, st, sp, ch))
+            .spawn(move || run_loop(c, s, st, sp, ch, au, aok))
             .ok();
 
         Self {
             shared,
+            audio,
+            audio_ok,
             status,
             stop,
             thread,
@@ -136,6 +149,16 @@ impl Stream {
                 .unwrap_or(0.0),
             None => 0.0,
         }
+    }
+
+    /// 音频缓冲：供播放器消费
+    pub fn audio(&self) -> AudioBuf {
+        self.audio.clone()
+    }
+
+    /// 这条流是否真的带音轨（探测结果）
+    pub fn audio_available(&self) -> bool {
+        self.audio_ok.load(Ordering::Relaxed)
     }
 
     /// 取最新一帧（Arc 克隆，代价极低）
@@ -205,7 +228,7 @@ impl Drop for Stream {
     }
 }
 
-fn build_command(cfg: &StreamCfg) -> Command {
+fn build_command(cfg: &StreamCfg, audio_port: u16) -> Command {
     let mut cmd = Command::new(&cfg.ffmpeg);
     cmd.arg("-hide_banner")
         .arg("-loglevel")
@@ -256,11 +279,27 @@ fn build_command(cfg: &StreamCfg) -> Command {
         cmd.arg("-fps_mode").arg("passthrough");
     }
 
+    cmd.arg("-map").arg("0:v:0");
+
     cmd.arg("-f")
         .arg("rawvideo")
         .arg("-pix_fmt")
         .arg("rgb24")
         .arg("-");
+
+    // 第二路输出：音频推到本地回环。
+    // 与视频共用同一个 RTSP 会话，摄像机只看到 1 个客户端。
+    if audio_port > 0 {
+        cmd.arg("-map")
+            .arg("0:a:0")
+            .arg("-f")
+            .arg("s16le")
+            .arg("-ar")
+            .arg("48000")
+            .arg("-ac")
+            .arg("1")
+            .arg(format!("tcp://127.0.0.1:{audio_port}"));
+    }
 
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
@@ -280,10 +319,20 @@ fn run_loop(
     status: Arc<Mutex<Status>>,
     stop: Arc<AtomicBool>,
     child_slot: Arc<Mutex<Option<Child>>>,
+    audio: AudioBuf,
+    audio_ok: Arc<AtomicBool>,
 ) {
     let frame_len = (cfg.width as usize) * (cfg.height as usize) * 3;
+
+    // 只探测一次：SDP 里有没有 m=audio。
+    // 注意该型号的 SDP 里 m=audio 的端口字段恒为 0，不能拿端口判断可用性。
+    let mut want_audio = cfg.audio && crate::discover::stream_has_audio(&cfg.url).unwrap_or(false);
+    audio_ok.store(want_audio, Ordering::Relaxed);
+
     let mut backoff: u64 = 1;
     let mut reconnects: u32 = 0;
+    // 带音频启动却一帧都没出的次数；连续两次就退回纯视频
+    let mut audio_fails: u8 = 0;
     let mut seq: u64 = 0;
 
     while !stop.load(Ordering::SeqCst) {
@@ -301,7 +350,20 @@ fn run_loop(
             };
         }
 
-        let spawned = build_command(&cfg).spawn();
+        // 每次启动都新建监听：临时端口，避免重连时旧端口被占
+        let (audio_port, audio_listener) = if want_audio {
+            match TcpListener::bind(("127.0.0.1", 0)) {
+                Ok(l) => match l.local_addr() {
+                    Ok(a) => (a.port(), Some(l)),
+                    Err(_) => (0, None),
+                },
+                Err(_) => (0, None),
+            }
+        } else {
+            (0, None)
+        };
+
+        let spawned = build_command(&cfg, audio_port).spawn();
         let mut child = match spawned {
             Ok(c) => c,
             Err(e) => {
@@ -317,6 +379,15 @@ fn run_loop(
                 continue;
             }
         };
+
+        // 等 ffmpeg 连上来，持续把音频写进缓冲
+        if let Some(l) = audio_listener {
+            let buf = audio.clone();
+            let sp = stop.clone();
+            let _ = std::thread::Builder::new()
+                .name("audio-read".into())
+                .spawn(move || read_audio(l, buf, sp));
+        }
 
         // 收集 stderr，便于定位 401 / 超时等问题
         let errbuf = Arc::new(Mutex::new(String::new()));
@@ -442,6 +513,19 @@ fn run_loop(
             *slot = None;
         }
 
+        // 带着音频却一帧都没出：多半是音轨把整条流拖死了。
+        // 连续两次就关掉音频重连——宁可没声音，也不能没画面。
+        if want_audio && !got_any {
+            audio_fails += 1;
+            if audio_fails >= 2 {
+                want_audio = false;
+                audio_ok.store(false, Ordering::Relaxed);
+                if let Ok(mut s) = status.lock() {
+                    s.msg = tr("音频不可用，已切回纯画面").into();
+                }
+            }
+        }
+
         if stop.load(Ordering::SeqCst) {
             break;
         }
@@ -473,6 +557,70 @@ fn run_loop(
 }
 
 /// 从管道读满一帧
+/// 接受 ffmpeg 的音频连接并持续读取，转成 i16 写入缓冲。
+///
+/// 设备没有音轨时 ffmpeg 不会连接，这里最多等 10 秒就退出，不留挂起线程。
+fn read_audio(listener: TcpListener, buf: AudioBuf, stop: Arc<AtomicBool>) {
+    let _ = listener.set_nonblocking(true);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut conn: Option<TcpStream> = None;
+    while Instant::now() < deadline {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        match listener.accept() {
+            Ok((s, _)) => {
+                conn = Some(s);
+                break;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return,
+        }
+    }
+    let Some(mut conn) = conn else {
+        return; // 没有音频流
+    };
+    let _ = conn.set_nonblocking(false);
+    let _ = conn.set_read_timeout(Some(Duration::from_millis(500)));
+
+    let mut raw = [0u8; 4096];
+    // TCP 不保证按采样边界切分，奇数个字节要留到下次
+    let mut carry: Option<u8> = None;
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        match conn.read(&mut raw) {
+            Ok(0) => break,
+            Ok(n) => {
+                let mut samples = Vec::with_capacity(n / 2 + 1);
+                let mut i = 0;
+                if let Some(hi) = carry.take() {
+                    samples.push(i16::from_le_bytes([raw[0], hi]));
+                    i = 1;
+                }
+                while i + 1 < n {
+                    samples.push(i16::from_le_bytes([raw[i], raw[i + 1]]));
+                    i += 2;
+                }
+                if i < n {
+                    carry = Some(raw[i]);
+                }
+                buf.push(&samples);
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                continue;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 fn read_exact_into<R: Read>(r: &mut R, buf: &mut [u8]) -> std::io::Result<()> {
     let mut filled = 0usize;
     while filled < buf.len() {

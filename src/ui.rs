@@ -1,7 +1,7 @@
 //! 主界面
 
 use crate::i18n::{self, tr};
-use crate::audio::{AudioCfg, AudioStream};
+use crate::audio::AudioPlayer;
 use crate::config::{self, AppConfig, Channel};
 use crate::detect::Detection;
 use crate::diag::{Action, Evaluator, Snapshot, StreamMetrics};
@@ -128,7 +128,7 @@ pub struct CamNexusApp {
     show_details: bool,
     hint_dismissed: bool,
     // ---- 音频 ----
-    audio_player: Option<AudioStream>,
+    audio_player: Option<AudioPlayer>,
     audio_idx: Option<usize>,
     volume: Arc<AtomicU32>,
     icons: VolumeIcons,
@@ -1101,26 +1101,21 @@ impl CamNexusApp {
             return;
         }
         self.stop_audio();
-        let Some(ffmpeg) = self.ffmpeg.clone() else {
-            self.toast(tr("未找到 ffmpeg，无法播放音频"));
+
+        // 音频现在由显示流顺带产出，不再单开一路 RTSP 连接。
+        // 这样做的好处：少占一个摄像机会话，切声音也不用重连。
+        let Some(stream) = self.streams.get(idx).and_then(|s| s.as_ref()) else {
+            self.toast(tr("该通道未连接"));
             return;
         };
-        let Some(ch) = self.cfg.channels.get(idx) else {
-            return;
-        };
-        if !ch.enabled || ch.url.trim().is_empty() {
-            self.toast(tr("该通道未启用"));
+        if !stream.audio_available() {
+            self.toast(tr("这一路没有音轨"));
             return;
         }
-        let url = ch.rtsp();
-        self.audio_player = Some(AudioStream::start(AudioCfg {
-            url,
-            ffmpeg,
-            tcp: self.cfg.tcp,
-            volume: self.volume.clone(),
-        }));
+        let buf = stream.audio();
+        buf.clear();
+        self.audio_player = Some(AudioPlayer::start(buf, self.volume.clone()));
         self.audio_idx = Some(idx);
-        self.toast(tr("正在连接音频…"));
     }
 
     fn stop_audio(&mut self) {
@@ -1787,6 +1782,8 @@ impl CamNexusApp {
             fps: self.cfg.fps,
             tcp: self.cfg.tcp,
             hwdec: self.cfg.hwdec.clone(),
+            // 音频与画面共用同一条 RTSP 会话，省掉单独一路连接
+            audio: true,
         }))
     }
 

@@ -41,6 +41,14 @@ fn main() -> eframe::Result<()> {
     i18n::set_lang(cfg.lang);
     let open_diag = args.iter().any(|a| a == "--diag");
     // --detect-test <图片>：用 ffmpeg 解码后跑一次检测，打印结果（自检用）
+    // --audio-test N：验证第 N 路（1 起）的音频是否随显示流一起到达
+    if let Some(i) = args.iter().position(|a| a == "--audio-test")
+        && let Some(n) = args.get(i + 1).and_then(|s| s.parse::<usize>().ok())
+    {
+        audio_test(n);
+        return Ok(());
+    }
+
     if let Some(i) = args.iter().position(|a| a == "--detect-test")
         && let Some(img) = args.get(i + 1) {
             let gpu = args.iter().any(|a| a == "--gpu");
@@ -178,6 +186,58 @@ fn image_size(buf: &[u8]) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+/// 自检：起一路流，观察 8 秒，报告画面与音频是否都到达。
+fn audio_test(idx1: usize) {
+    use std::time::{Duration, Instant};
+
+    let cfg = config::AppConfig::load();
+    let Some(ch) = cfg.channels.get(idx1.saturating_sub(1)) else {
+        println!("没有第 {idx1} 路通道");
+        return;
+    };
+    let Some(ff) = config::find_ffmpeg(&cfg.ffmpeg_path) else {
+        println!("未找到 ffmpeg");
+        return;
+    };
+
+    println!("通道: {}  {}", ch.name, ch.display_rtsp());
+    println!("探测 SDP 音轨…");
+    let has_audio = discover::stream_has_audio(&ch.display_rtsp());
+    println!("  SDP 含 m=audio: {has_audio:?}");
+
+    let stream = stream::Stream::spawn(stream::StreamCfg {
+        url: ch.display_rtsp(),
+        ffmpeg: ff,
+        width: cfg.render_width,
+        height: cfg.render_height,
+        fps: cfg.fps,
+        tcp: cfg.tcp,
+        hwdec: cfg.hwdec.clone(),
+        audio: true,
+    });
+
+    let started = Instant::now();
+    let mut printed_frame = false;
+    while started.elapsed() < Duration::from_secs(8) {
+        std::thread::sleep(Duration::from_millis(250));
+        if !printed_frame
+            && let Some(f) = stream.frame()
+        {
+            println!("首帧到达: {}x{}", f.w, f.h);
+            printed_frame = true;
+        }
+    }
+
+    let st = stream.status();
+    let buf = stream.audio();
+    println!("--- 结果 ---");
+    println!("画面状态: {:?}  帧数 {}  帧率 {:.1}", st.state, st.frames, st.fps);
+    println!("音轨可用: {}", stream.audio_available());
+    println!("收到音频数据: {}", buf.active());
+    println!("音量电平: {:.3}", buf.level());
+    println!("连接次数: {}", st.reconnects);
 }
 
 /// 自检：图片 → RGB24 → 检测 → 打印，用于验证解码/后处理是否正确

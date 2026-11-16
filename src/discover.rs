@@ -397,6 +397,46 @@ fn candidates(hint: &str) -> Vec<&'static str> {
     ]
 }
 
+/// 该 RTSP 地址的 SDP 是否声明了音轨。
+///
+/// 返回 `None` 表示探测失败（连不上、认证失败、超时），调用方应按「无音频」保守处理。
+///
+/// 一个坑：这台海康的 SDP 里 `m=video 0` / `m=audio 0` 端口字段都是 0，
+/// 实际却能正常出流。所以只能看有没有 `m=audio` 这一行，不能拿端口判断。
+pub fn stream_has_audio(url: &str) -> Option<bool> {
+    let (host, port, path, user, pass) = parse_rtsp_url(url)?;
+    if host.is_empty() {
+        return None;
+    }
+    let mut s = connect_rtsp(&host, port).ok()?;
+
+    let first = rtsp_exchange(&mut s, &host, port, "DESCRIBE", &path, None, 1).ok()?;
+    let body = if first.code == 200 {
+        first.body
+    } else if first.code == 401 {
+        let challenge = first
+            .headers
+            .get("www-authenticate")
+            .cloned()
+            .unwrap_or_default();
+        let uri = format!("rtsp://{host}:{port}{path}");
+        let auth = if challenge.to_lowercase().starts_with("basic") {
+            format!("Basic {}", STANDARD.encode(format!("{user}:{pass}")))
+        } else {
+            digest_auth(&challenge, "DESCRIBE", &uri, &user, &pass)?
+        };
+        let second = rtsp_exchange(&mut s, &host, port, "DESCRIBE", &path, Some(&auth), 2).ok()?;
+        if second.code != 200 {
+            return None;
+        }
+        second.body
+    } else {
+        return None;
+    };
+
+    Some(body.to_lowercase().contains("m=audio"))
+}
+
 /// 在单条 TCP 连接上完成 DESCRIBE →（按需认证）DESCRIBE，返回 (是否可用, 说明)
 ///
 /// 注意两点而不是想当然：
@@ -640,4 +680,35 @@ pub fn scan_async(prefix: String, user: String, pass: String, tx: Sender<ScanMsg
         });
         let _ = tx.send(ScanMsg::Done(list));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_rtsp_url_handles_credentials() {
+        let (h, p, path, u, pw) = parse_rtsp_url(
+            "rtsp://admin:p%40ss%3A1@192.168.1.10:554/Streaming/Channels/101",
+        )
+        .unwrap();
+        assert_eq!(h, "192.168.1.10");
+        assert_eq!(p, 554);
+        assert_eq!(path, "/Streaming/Channels/101");
+        assert_eq!(u, "admin");
+        assert_eq!(pw, "p@ss:1");
+    }
+
+    #[test]
+    fn parse_rtsp_url_defaults_port() {
+        let (h, p, _, u, _) = parse_rtsp_url("rtsp://192.168.1.10/live").unwrap();
+        assert_eq!(h, "192.168.1.10");
+        assert_eq!(p, 554);
+        assert!(u.is_empty());
+    }
+
+    #[test]
+    fn parse_rtsp_url_rejects_garbage() {
+        assert!(parse_rtsp_url("http://x/y").is_none());
+    }
 }
