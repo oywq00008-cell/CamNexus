@@ -344,8 +344,8 @@ fn run_loop(
     let mut seq: u64 = 0;
 
     while !stop.load(Ordering::SeqCst) {
-        {
-            let mut s = status.lock().unwrap();
+        // 其余地方都用 if let Ok：锁被毒化时宁可少更新一次状态，也不要 panic 掉整条取流线程
+        if let Ok(mut s) = status.lock() {
             s.state = if reconnects == 0 {
                 State::Connecting
             } else {

@@ -107,6 +107,8 @@ struct Recorder {
     expect_secs: u32,
     /// 写入心跳是否已检查过
     heartbeat_done: bool,
+    /// 是否因写入停滞被强制结束（用于区分"断线"与"写不进盘"）
+    stalled: bool,
 }
 
 impl Recorder {
@@ -341,6 +343,7 @@ impl RecordManager {
                             size / 1024
                         );
                         logs::append(&ch.name, &i18n::rec_stalled(&detail));
+                        r.stalled = true;
                         let _ = r.child.kill();
                     }
                 }
@@ -356,9 +359,21 @@ impl RecordManager {
                     let user_stop = !slot.want;
                     let cut_short = actual < expect * 0.9;
 
-                    if size < 64 * 1024 {
-                        // 秒退：连一帧都没写进去
+                    if r.stalled {
+                        // 写入停滞：多半是磁盘满/权限变化/文件被占用，
+                        // 按可重试错误处理，间隔逐步拉长，避免空文件刷屏
                         let _ = std::fs::remove_file(&r.path);
+                        slot.fails = slot.fails.saturating_add(1);
+                        let shift = (slot.fails - 1).min(5) as u32;
+                        let wait = (1u64 << shift).min(RETRY_MAX_SECS);
+                        slot.retry_at = Some(Instant::now() + Duration::from_secs(wait));
+                        logs::append(&ch.name, &i18n::rec_stalled_retry(slot.fails, wait));
+                    } else if size < 64 * 1024 {
+                        // 秒退：连一帧都没写进去
+                        // 用户主动停止时保留文件，别把人家的片段删了
+                        if !user_stop {
+                            let _ = std::fs::remove_file(&r.path);
+                        }
                         slot.fails = slot.fails.saturating_add(1);
                         let config_err = is_config_error(&detail);
                         if config_err {
@@ -736,6 +751,7 @@ fn spawn_segment_inner(
         started_at: Instant::now(),
         expect_secs: secs,
         heartbeat_done: false,
+        stalled: false,
     })
 }
 

@@ -46,34 +46,6 @@ fn main() -> eframe::Result<()> {
     // 语言必须在任何界面文案之前确定：i18n 的 tr() 全靠这个全局状态
     i18n::set_lang(cfg.lang);
 
-    // 单实例：开了开机自启之后，登录时可能已有实例在跑，
-    // 用户再双击图标就会起第二份——两套取流直接顶满相机连接数。
-    if !single_instance() {
-        return Ok(());
-    }
-
-    // 自启项自愈：程序被移动过、或注册表被清理过，这里补回来
-    if cfg.autostart
-        && let Ok(exe) = std::env::current_exe()
-    {
-        let want = sys::autostart_command(&exe, cfg.guard);
-        if sys::autostart_read().as_deref() != Some(want.as_str()) {
-            let _ = sys::set_autostart(&exe, cfg.guard, true);
-        }
-    }
-    let open_diag = args.iter().any(|a| a == "--diag");
-    // --screenshot <路径> [--screenshot-delay 秒]：延时截一张图后退出
-    let shot_path = args
-        .iter()
-        .position(|a| a == "--screenshot")
-        .and_then(|i| args.get(i + 1))
-        .map(std::path::PathBuf::from);
-    let shot_delay = args
-        .iter()
-        .position(|a| a == "--screenshot-delay")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(12);
     // --detect-test <图片>：用 ffmpeg 解码后跑一次检测，打印结果（自检用）
     // --net-test：打印各网卡 2 秒内的收发速率，用于核对数据栏的读数
     if args.iter().any(|a| a == "--net-test") {
@@ -97,6 +69,22 @@ fn main() -> eframe::Result<()> {
             return Ok(());
         }
 
+    // 单实例：开了开机自启之后，登录时可能已有实例在跑，
+    // 用户再双击图标就会起第二份——两套取流直接顶满相机连接数。
+    if !single_instance() {
+        return Ok(());
+    }
+
+    // 自启项自愈：程序被移动过、或注册表被清理过，这里补回来
+    if cfg.autostart
+        && let Ok(exe) = std::env::current_exe()
+    {
+        let want = sys::autostart_command(&exe, cfg.guard);
+        if sys::autostart_read().as_deref() != Some(want.as_str()) {
+            let _ = sys::set_autostart(&exe, cfg.guard, true);
+        }
+    }
+    let open_diag = args.iter().any(|a| a == "--diag");
     // --settings-tab N：直接打开设置并切到第 N 个标签页（0 起），方便截图核对
     let settings_tab = args
         .iter()
@@ -186,9 +174,6 @@ fn main() -> eframe::Result<()> {
             if let Some(n) = audio_start {
                 app.start_audio_index(n.saturating_sub(1));
             }
-            if let Some(p) = shot_path.clone() {
-                app.schedule_screenshot(p, std::time::Duration::from_secs(shot_delay));
-            }
             Ok(Box::new(app))
         }),
     );
@@ -253,7 +238,8 @@ fn instance_pid_path() -> std::path::PathBuf {
 fn process_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW,
+        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     unsafe {
@@ -263,8 +249,21 @@ fn process_alive(pid: u32) -> bool {
         }
         let mut code: u32 = 0;
         let ok = GetExitCodeProcess(h, &mut code);
+        if ok == 0 || code != STILL_ACTIVE as u32 {
+            CloseHandle(h);
+            return false;
+        }
+        // 系统会把 PID 复用给别的程序。只看到"活着"不够，
+        // 还要确认它确实是 CamNexus，否则会出现"点了没反应"的怪现象。
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let named = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len);
         CloseHandle(h);
-        ok != 0 && code == STILL_ACTIVE as u32
+        if named == 0 {
+            return false;
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        path.to_ascii_lowercase().ends_with("camnexus.exe")
     }
 }
 
@@ -385,6 +384,7 @@ fn net_test() {
     }
     println!();
     println!("统计合计：下行 {}  上行 {}", sys::human_rate(tot_dn), sys::human_rate(tot_up));
+
 }
 
 /// 自检：起一路流，观察 8 秒，报告画面与音频是否都到达。

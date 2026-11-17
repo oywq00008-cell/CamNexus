@@ -501,6 +501,14 @@ pub fn rec_cut_short(name: &str, actual_min: f64, expect_min: f64) -> String {
 }
 
 /// 写入心跳异常：进程活着但文件几乎没长
+/// 写入停滞后的重试安排
+pub fn rec_stalled_retry(n: impl std::fmt::Display, secs: u64) -> String {
+    match lang() {
+        Lang::Zh => format!("写入停滞（第 {n} 次，{secs} 秒后重试）"),
+        Lang::En => format!("Recording stalled (attempt {n}, retrying in {secs}s)"),
+    }
+}
+
 pub fn rec_stalled(detail: &str) -> String {
     match lang() {
         Lang::Zh => format!("录像没有在写盘（{detail}），已重启该段"),
@@ -861,6 +869,13 @@ const PAIRS: &[(&str, &str)] = &[
     ("登录 Windows 后自动运行本程序，不弹窗、不请求管理员权限", "Launches after you sign in — no window prompt, no admin request"),
     ("由守护进程看住主程序：异常退出会立刻重新拉起；正常关窗口则一起退出", "A watchdog relaunches the app if it crashes; closing the window stops both"),
     ("程序启动后自动开始录制所有已启用通道；画面未连上的通道会等它上线后再开录", "Records every enabled channel on launch; channels that are offline start once they come online"),
+    ("CPU 占用", "CPU usage"),
+    ("时间", "Clock"),
+    ("手动添加", "Add manually"),
+    ("扫描局域网自动发现摄像机，或者手动填写一个 RTSP 地址", "Scan the network for cameras, or enter an RTSP address yourself"),
+    ("该通道未连接", "This channel is not connected"),
+    ("这一路没有音轨", "This channel has no audio track"),
+    ("音频不可用，已切回纯画面", "Audio unavailable — switched back to video only"),
     ("录像启动失败", "Recording failed to start"),
     ("录像连续失败，已停止", "recording kept failing and was stopped"),
     ("录像结束", "Recording finished"),

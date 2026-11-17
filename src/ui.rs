@@ -158,8 +158,6 @@ pub struct CamNexusApp {
     mem_pct: f32,
     /// 每路画面是否在线（约每秒刷新一次），录像只在在线的通道上启动
     online_mask: Vec<bool>,
-    /// 定时截图：到点截一张存盘后退出（--screenshot）
-    pending_shot: Option<(std::path::PathBuf, Instant)>,
     last_sample: Instant,
     upload_ms: std::collections::HashMap<usize, f32>,
     show_details: bool,
@@ -866,7 +864,6 @@ impl CamNexusApp {
             net_up: 0.0,
             mem_pct: 0.0,
             online_mask: Vec::new(),
-            pending_shot: None,
             last_sample: Instant::now(),
             upload_ms: Default::default(),
             show_details: false,
@@ -1272,32 +1269,6 @@ impl CamNexusApp {
     }
 
     // ---------------------------------------------------------------- 顶栏
-    /// 定时截图：给远程机器用——那边装不了截图工具，让程序自己抓。
-    pub fn schedule_screenshot(&mut self, path: std::path::PathBuf, delay: Duration) {
-        self.pending_shot = Some((path, Instant::now() + delay));
-    }
-
-    fn maybe_take_screenshot(&mut self, ctx: &egui::Context) {
-        let Some((path, at)) = self.pending_shot.as_ref() else {
-            return;
-        };
-        if Instant::now() < *at {
-            return;
-        }
-        let path = path.clone();
-        self.pending_shot = None;
-        ctx.request_screenshot(move |image| {
-            let ok = save_png(&image, &path);
-            eprintln!(
-                "截图{}：{}",
-                if ok { "已保存" } else { "保存失败" },
-                path.display()
-            );
-            // 截图是一次性任务，存完直接退出，免得还要人去关窗口
-            std::process::exit(if ok { 0 } else { 1 });
-        });
-    }
-
     /// 顶栏左侧的数据栏。
     ///
     /// 一个圆角矩形包住若干指标，右端三点打开勾选面板。
@@ -1342,8 +1313,9 @@ impl CamNexusApp {
         if bar.net {
             segs.push(Seg {
                 dot: Some(ACCENT),
+                // 用实心三角而不是 ↓↑：细箭头在小字号下会被读成数字 1
                 text: format!(
-                    "↓{} ↑{}",
+                    "▼ {}  ▲ {}",
                     sys::human_rate(self.net_down),
                     sys::human_rate(self.net_up)
                 ),
@@ -1406,13 +1378,27 @@ impl CamNexusApp {
         const GAP: f32 = 10.0; // 文本与分隔线之间
         const MENU_W: f32 = 26.0;
 
-        let mut w = PAD_X * 2.0 + MENU_W;
-        for (i, sw) in seg_w.iter().enumerate() {
-            if i > 0 {
-                w += GAP * 2.0 + 1.0;
+        let measure = |ws: &[f32]| {
+            let mut w = PAD_X * 2.0 + MENU_W;
+            for (i, sw) in ws.iter().enumerate() {
+                if i > 0 {
+                    w += GAP * 2.0 + 1.0;
+                }
+                w += sw;
             }
-            w += sw;
+            w
+        };
+
+        // 窗口窄的时候，右侧还有一排按钮。数据栏要是太宽会把它们挤掉，
+        // 所以从最后一项开始舍弃（在线数永远保留），保证两边都放得下。
+        let budget = (ui.available_width() * 0.55).max(140.0);
+        let mut seg_w = seg_w;
+        while measure(&seg_w) > budget && segs.len() > 1 {
+            segs.pop();
+            seg_w.pop();
         }
+
+        let w = measure(&seg_w);
 
         let (rect, _) = ui.allocate_exact_size(egui::vec2(w, H), egui::Sense::hover());
         let painter = ui.painter();
@@ -4479,7 +4465,6 @@ impl eframe::App for CamNexusApp {
             s.tick();
         }
 
-        self.maybe_take_screenshot(&ctx);
         self.update_textures(&ctx);
         self.sample_metrics();
 
@@ -4643,28 +4628,6 @@ fn apply_window_title(ctx: &egui::Context) {
     ));
 }
 
-
-/// ColorImage → PNG。用 tiny-skia（resvg 自带），不额外引依赖。
-fn save_png(image: &egui::ColorImage, path: &std::path::Path) -> bool {
-    let (w, h) = (image.width() as u32, image.height() as u32);
-    if w == 0 || h == 0 {
-        return false;
-    }
-    let mut buf = Vec::with_capacity((w * h * 4) as usize);
-    for px in &image.pixels {
-        buf.extend_from_slice(&[px.r(), px.g(), px.b(), px.a()]);
-    }
-    let Some(size) = resvg::tiny_skia::IntSize::from_wh(w, h) else {
-        return false;
-    };
-    let Some(pixmap) = resvg::tiny_skia::Pixmap::from_vec(buf, size) else {
-        return false;
-    };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    pixmap.save_png(path).is_ok()
-}
 
 fn apply_style(ctx: &egui::Context, dark: bool) {
     ctx.set_theme(if dark {

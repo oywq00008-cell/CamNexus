@@ -450,7 +450,9 @@ pub fn autostart_read() -> Option<String> {
         if rc != 0 {
             return None;
         }
-        let u16s: Vec<u16> = buf[..len as usize]
+        // 值比缓冲区长时，系统会把 len 设成所需字节数——直接切片会越界
+        let len = (len as usize).min(buf.len());
+        let u16s: Vec<u16> = buf[..len]
             .as_chunks::<2>()
             .0
             .iter()
