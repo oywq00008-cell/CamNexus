@@ -86,7 +86,9 @@ The goal is simple: **turn an old PC into a surveillance recorder**. That's why 
 | GPU | Not required; integrated or discrete graphics can enable hardware decoding |
 | Network | Same LAN as the cameras |
 
-**FFmpeg is not required up front** — the app downloads and verifies it on first launch, storing it under `%LOCALAPPDATA%\CamNexus`.
+**FFmpeg is not required up front** — the app downloads it on first launch and then checks that it actually runs (one `-version` call), storing it under `%LOCALAPPDATA%\CamNexus`.
+
+> FFmpeg is invoked as a **separate process**: it is not linked, not bundled and not distributed with this app. It is published under GPLv3, copyright the FFmpeg authors, source at [ffmpeg.org](https://ffmpeg.org).
 
 ---
 
@@ -246,3 +248,7 @@ A missing Windows SDK only produces a warning — the build still succeeds, just
 [MIT](LICENSE) © 2026 oywq0008-cell
 
 CamNexus does not bundle or redistribute FFmpeg; it is downloaded on the user's machine at first launch.
+
+The app runs FFmpeg from the command line (a separate process, no library linking) using a GPLv3 build. FFmpeg is copyright its authors and published under GPLv3; source at [ffmpeg.org](https://ffmpeg.org).
+
+> If you repackage this app together with a downloaded `ffmpeg.exe` and pass it on, **that redistribution** has to comply with GPLv3 (ship the licence text and an offer of source). Distributing the app alone and letting the recipient download FFmpeg for themselves avoids this.

@@ -86,7 +86,9 @@ CamNexus 是一个 Windows 桌面程序，用来同时查看和录制局域网�
 | 显卡 | 无要求；有独显或核显可开硬件解码降低占用 |
 | 网络 | 与摄像机在同一局域网 |
 
-**FFmpeg 不需要自己装**——首次启动会自动下载并校验，存放在 `%LOCALAPPDATA%\CamNexus`。
+**FFmpeg 不需要自己装**——首次启动会自动下载，并在下载后确认它能正常运行（跑一次 `-version`），存放在 `%LOCALAPPDATA%\CamNexus`。
+
+> FFmpeg 由本项目以**独立进程**方式调用，不链接、不打包、不随本程序分发；它由第三方以 GPLv3 发布，版权归 FFmpeg 作者所有，源码见 [ffmpeg.org](https://ffmpeg.org)。
 
 ---
 
@@ -246,3 +248,7 @@ Windows SDK 缺失时只会告警，程序仍可构建（只是没有图标和�
 [MIT](LICENSE) © 2026 oywq0008-cell
 
 程序本身不包含也不分发 FFmpeg，由用户机器首次运行时自行下载。
+
+本程序通过命令行调用 FFmpeg（独立进程，不链接其库），使用的是 GPLv3 构建。FFmpeg 的版权归其作者所有，以 GPLv3 发布，源码见 [ffmpeg.org](https://ffmpeg.org)。
+
+> 如果你把本程序和下载好的 `ffmpeg.exe` 一起打包转发给别人，**转发行为本身**需要遵守 GPLv3（附许可证全文并提供源码获取方式）。建议直接分发本程序，让接收方自行启动下载。
