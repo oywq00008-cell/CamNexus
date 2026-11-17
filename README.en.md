@@ -30,14 +30,25 @@ The goal is simple: **turn an old PC into a surveillance recorder**. That's why 
 - **Sub-stream support** — main stream for big views, sub-stream for small ones
 - **Audio** — enable sound for any individual channel; it rides on the same connection as the picture, so it costs no extra camera session
 - **Hardware decoding** — CUDA / D3D11VA / QSV / AMF, handing decoding to the GPU
+- **Data bar** — the top bar shows live channels, clock, network throughput, CPU and memory; click the ⋮ at its right edge to choose which of them appear
 
 ### Recording & playback
 
 - **Records the original stream** — the camera's own bitstream is packaged into MP4, no re-encoding, near-zero CPU
-- **Segmented files** — organised by channel and date, with timestamps in the name
+- **Hourly segments** — organised by channel and date; files are cut on the hour with seconds in the name, so a retry can never overwrite the previous one
+- **Recovers on its own** — network failures are retried indefinitely (30 s ceiling). Power loss, a switch reboot or a camera restart all heal by themselves
+- **Records only when there is a picture** — an offline camera never starts a segment, so no empty files and no wasted retries
 - **Storage cap** — 500 GB by default; the oldest files are deleted first, and the cap never exceeds the free disk space
 - **Playback** — built-in player, browsable by date and channel
 - **Snapshots** — save the current frame as an image
+
+### Unattended operation
+
+- **Start with Windows** — launches after you sign in; written to the current user's startup entries, no admin rights needed
+- **Process watchdog** — relaunches the app if it crashes, and exits together with it when you close the window
+- **Record on launch** — goes straight into recording at boot; channels that are not online yet start as soon as they connect
+
+> The watchdog depends on the startup entry: enabling it without startup would leave nothing to launch it after a reboot, so the two are linked in Settings.
 
 ### Image adjustments
 
@@ -57,6 +68,7 @@ The goal is simple: **turn an old PC into a surveillance recorder**. That's why 
 - Simplified Chinese / English
 - Dark and light themes
 - First-run guided tour
+- Configurable data bar in the top bar
 
 ### Experimental (off by default)
 
@@ -94,13 +106,13 @@ The goal is simple: **turn an old PC into a surveillance recorder**. That's why 
 ## A quick look at the UI
 
 ```
-┌─────────────────────────────────────────────────┐
-│ CamNexus  2/2 online   Playback  Log …   Settings│  ← top bar
-├─────────────────────────────────────────────────┤
-│ ┌───────────┐ ┌───────────┐                     │
-│ │ Channel 1 │ │ Channel 2 │                     │  ← video area
-│ └───────────┘ └───────────┘                     │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ ● 2/2 online │ 10:42:07 │ ▼2.3 MB/s ⋮   Playback Settings   │  ← top bar (data bar on the left)
+├──────────────────────────────────────────────────────────────┤
+│ ┌───────────┐ ┌───────────┐                                 │
+│ │ Channel 1 │ │ Channel 2 │                                 │  ← video area
+│ └───────────┘ └───────────┘                                 │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 | What you want | Where |
@@ -108,6 +120,8 @@ The goal is simple: **turn an old PC into a surveillance recorder**. That's why 
 | Add or edit channels | Top bar → Settings → Channels |
 | Recording options, storage cap | Top bar → Settings → Recording |
 | Resolution, decoding, theme, language | Top bar → Settings → Display / General |
+| Start with Windows, watchdog, record on launch | Top bar → Settings → General → Startup & runtime |
+| Which metrics the data bar shows | ⋮ at the right edge of the data bar |
 | Browse recordings | Top bar → Playback |
 | Zoom one channel | Double-click it |
 | Enter / leave fullscreen | Bottom-right button; `Esc` to exit |
@@ -146,6 +160,7 @@ Actions
 | Storage cap | 500 GB | Oldest files are removed first; set 0 for no limit |
 | Mode | Original stream (no re-encode) | Near-zero CPU, identical to the camera's own quality |
 | Audio | On | The camera's microphone or audio track is stored in the MP4 |
+| Segments | Hourly | One file per hour, named `date start-end`; a retry never overwrites an earlier file |
 
 Files are organised as `channel / date / time`, and can be opened with any media player — no dependency on this app.
 
@@ -178,6 +193,14 @@ Check three things: the address is complete, the credentials are correct, and RT
 **The picture is a narrow strip with black bars.**
 
 The stream itself is probably portrait video padded into a landscape frame. Right-click → **Trim black borders**, then rotate 90°.
+
+**Does it recover after a power cut or a network drop?**
+
+Yes. Streams reconnect with a 1→2→4→8→10 second backoff, and recording retries network errors indefinitely with a 30 second ceiling, resuming as soon as the camera is back. With **start with Windows + process watchdog** enabled, the app itself comes back after a reboot and carries on recording.
+
+**What happens if I launch it twice?**
+
+The second copy exits immediately. A single-instance lock keeps exactly one process running — two copies would exhaust the camera's connection limit.
 
 **Recordings take too much space.**
 

@@ -63,5 +63,15 @@
     "enabled": false
   },
   "lang": "zh",
-  "tiles": []
+  "tiles": [],
+  "bar": {
+    "online": true,
+    "clock": false,
+    "net": false,
+    "cpu": false,
+    "mem": false
+  },
+  "autostart": false,
+  "guard": false,
+  "auto_record": false
 }
