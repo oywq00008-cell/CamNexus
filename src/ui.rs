@@ -1808,8 +1808,11 @@ impl CamNexusApp {
                 if ui.button(tr("日志")).clicked() {
                     open_logs = true;
                 }
-                // 识别是实验功能：只有用户在设置里启用、且模型已下载，主界面才出现这个按钮
-                if self.cfg.detect.enabled && self.model_ready_now() {
+                // 只要模型装好了就显示这个按钮。
+                //
+                // 之前额外要求 `enabled`：一旦从顶栏关掉识别（enabled 也跟着变 false），
+                // 按钮直接消失，用户只能钻进设置里才能再打开——看着就像「功能没了」。
+                if self.model_ready_now() {
                     let detect_on = self.detect.as_ref().map(|d| d.enabled).unwrap_or(false);
                     let label = if detect_on {
                         egui::RichText::new(tr("识别 · 开")).color(OK)
@@ -1874,8 +1877,13 @@ impl CamNexusApp {
                     if !d.enabled {
                         d.results.clear();
                     }
-                    // 落盘：崩溃后被守护进程拉起时才不会再变回关闭
+                    // 落盘两个字段：
+                    //   running —— 上次是不是开着（崩溃后被守护拉起时用它恢复）
+                    //   enabled —— 功能总开关
+                    // 只写 running 会留下「running=true、enabled=false」的组合，
+                    // 重启时启动条件不成立，表现就是「识别开关自己关掉了」。
                     self.cfg.detect.running = d.enabled;
+                    self.cfg.detect.enabled = d.enabled;
                     let _ = self.cfg.save();
                     refresh_taps = true;
                     logs::append(
@@ -4248,8 +4256,12 @@ impl CamNexusApp {
                         if self.draft.detect.enabled {
                             // 刚启用这个功能：默认就让它跑起来
                             self.draft.detect.running = true;
-                        } else if let Some(d) = self.detect.as_mut() {
-                            d.results.clear();
+                        } else {
+                            // 关掉功能就别再「记住上次开着」——否则下次启动还会被拉起来
+                            self.draft.detect.running = false;
+                            if let Some(d) = self.detect.as_mut() {
+                                d.results.clear();
+                            }
                         }
                     }
                 });
@@ -5471,7 +5483,16 @@ impl eframe::App for CamNexusApp {
             if should_autostart_detect(&self.cfg.detect, self.model_ready_now()) {
                 self.detect =
                     Some(DetectRuntime::spawn(ctx.clone(), self.cfg.detect.clone()));
+                if !self.cfg.detect.enabled {
+                    // 历史配置里 enabled 漏写了，这里补上，别让下次又踩一遍
+                    self.cfg.detect.enabled = true;
+                    let _ = self.cfg.save();
+                }
                 logs::append("识别", tr("启动时自动开启识别"));
+                // 关键：tap 在重建通道时就建好了，那时 enabled 还是 false，
+                // 于是「事件录像未接入」。识别这会儿才被拉起来，必须补建一次，
+                // 否则界面显示识别已开、事件录像却一直不触发。
+                self.start_event_taps();
             } else if self.cfg.detect.enabled {
                 logs::append("识别", tr("识别未自动开启（模型或许可不可用）"));
             }
@@ -6250,8 +6271,13 @@ impl DetectRuntime {
 /// 三个条件缺一不可：功能开着（设置里的实验开关）、上次退出时是开着的、
 /// 模型已就绪。单独抽出来是为了能穷举验证——这条判断错了，
 /// 崩溃重启后事件录像会静默失效，很难发现。
+/// 启动时该不该自动开识别。
+///
+/// 判据是 `running`（用户最后选择的开关状态），不再要求 `enabled`：
+/// 早期版本从顶栏开识别时只写了 `running`，留下 `enabled=false` 的配置，
+/// 那种配置按旧判据永远恢复不了，用户看到的就是「重启后识别自己关了」。
 fn should_autostart_detect(cfg: &crate::config::DetectCfg, model_ready: bool) -> bool {
-    cfg.enabled && cfg.running && model_ready
+    cfg.running && model_ready
 }
 
 /// 报告窗口的缓存：日志解析和目录扫描都不便宜，别每帧做
@@ -6504,26 +6530,41 @@ fn log_settings_change(old: &AppConfig, new: &AppConfig) {
 
 
 
+    /// 启动恢复只看两件事：用户上次选择开着、模型可用。
+    ///
+    /// 早期版本还要求 `enabled`，而顶栏开关只写 `running`，
+    /// 于是配置里会出现 running=true / enabled=false，重启后永远恢复不了。
     #[test]
-    fn autostart_needs_all_three_conditions() {
+    fn autostart_follows_running_and_model() {
         let base = || crate::config::DetectCfg {
             enabled: true,
             running: true,
             ..Default::default()
         };
         assert!(should_autostart_detect(&base(), true));
-        // 功能没启用
+
+        // 上次是关着的 → 不恢复
         assert!(!should_autostart_detect(
-            &crate::config::DetectCfg { enabled: false, ..base() },
+            &crate::config::DetectCfg {
+                running: false,
+                ..base()
+            },
             true
         ));
-        // 上次是关着的
-        assert!(!should_autostart_detect(
-            &crate::config::DetectCfg { running: false, ..base() },
-            true
-        ));
-        // 模型不可用
+        // 模型不可用 → 不恢复
         assert!(!should_autostart_detect(&base(), false));
+        // 历史遗留配置：enabled 漏写也要能恢复（否则就是「重启后识别自己关了」）
+        assert!(
+            should_autostart_detect(
+                &crate::config::DetectCfg {
+                    enabled: false,
+                    running: true,
+                    ..base()
+                },
+                true
+            ),
+            "running=true 就该恢复，enabled 只用来补写"
+        );
     }
 
 #[cfg(test)]

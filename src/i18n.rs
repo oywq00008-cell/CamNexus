@@ -301,9 +301,15 @@ pub fn detect_load(ms: f32, fps: u32, channels: u32, load: f32) -> String {
 
 pub fn detect_tip(fps: u32, dev: &str) -> String {
     match lang() {
-        Lang::Zh => format!("按 {fps} FPS 抽帧做人体/车辆识别（{dev}），只标出在动的目标"),
+        // 顺带说清代价：事件录像模式下每路会多一个常驻取流进程，
+        // 用户看到任务管理器里多出 4 个 ffmpeg 时不会以为是泄漏。
+        Lang::Zh => format!(
+            "按 {fps} FPS 抽帧做人体/车辆识别（{dev}），只标出在动的目标。
+             事件录像模式下每路会额外常驻一个取流进程（多占一条相机会话）"
+        ),
         Lang::En => format!(
-            "Sample frames at {fps} FPS for person/vehicle detection ({dev}); only moving targets are boxed"
+            "Sample frames at {fps} FPS for person/vehicle detection ({dev}); only moving targets are boxed.
+             In event-recording mode each channel keeps one extra streaming process alive (one more camera session)"
         ),
     }
 }
