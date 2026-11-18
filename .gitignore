@@ -21,6 +21,9 @@
 # 用户下载的原始素材目录（已归档到 assets/）
 /喇叭
 
+# 内部工作文档（设计稿、合规核查、进度日志）——留在本地，不进仓库
+/docs
+
 # 本机测试包（含 ffmpeg.exe、DirectML.dll、带凭据的 config.json，共 135 MB）
 /testkit
 
