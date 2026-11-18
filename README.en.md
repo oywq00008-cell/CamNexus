@@ -37,7 +37,7 @@ The goal is simple: **turn an old PC into a surveillance recorder**. That's why 
 - **Sub-stream support** — main stream for big views, sub-stream for small ones
 - **Audio** — enable sound for any individual channel; it rides on the same connection as the picture, so it costs no extra camera session
 - **Hardware decoding** — CUDA / D3D11VA / QSV / AMF, handing decoding to the GPU
-- **Data bar** — the top bar shows live channels, clock, network throughput, CPU and memory; click the ⋮ at its right edge to choose which of them appear
+- **Data bar** — the top bar shows live channels, clock, network throughput, CPU and memory. Click the ⋮ at its right edge to toggle each item; the menu stays open while you tick several
 
 ### Recording & playback
 
@@ -76,7 +76,6 @@ The goal is simple: **turn an old PC into a surveillance recorder**. That's why 
 - Simplified Chinese / English, **selectable on the first screen of the tour** — the rest of the guide follows immediately
 - Dark and light themes
 - An 11-step guided tour on first run, from the data bar down to the recording modes; replay it any time from the button at the bottom of Settings
-- Configurable data bar: tick as many items as you like — the menu stays open until you click elsewhere
 
 ### Experimental (off by default)
 
@@ -327,15 +326,11 @@ The app **does not bundle** the components below, but it does use them:
 | DirectML.dll | GPU inference (ONNX Runtime's DirectML backend) | Microsoft redistributable, per the Windows SDK terms | shipped with the app |
 | Detection models (optional) | person / vehicle detection | YOLOX: Apache-2.0; YOLO26: AGPL-3.0 | downloaded by the user from inside the app |
 
-**About the detection models**: the YOLO26 family is published by [Ultralytics](https://ultralytics.com) under AGPL-3.0.
-This app does not bundle, mirror or distribute those weights; you start the download yourself, and you must first read
-the licence notice in a dialog and tick the box — without that, neither downloading nor enabling detection is possible.
-Using these models in a closed-source commercial product or service requires a commercial licence from Ultralytics.
+This app does not bundle, mirror or distribute those weights; you start the download yourself, and you must first
+read the licence notice and tick the box. How the two licences differ (Apache-2.0 vs AGPL-3.0, and AGPL's
+network-service clause) is covered under [License](#license).
 
-The weights carry their own licence field (`license = AGPL-3.0 License`), so you can verify it directly.
-You can delete them at any time from Settings; they live in `%LOCALAPPDATA%\CamNexus\models`.
-
-The same table is shown inside the app under **About**, together with the version you are running and the model currently in use.
+The same table is shown inside the app under **About**, together with the version you are running and the model in use.
 
 ---
 
