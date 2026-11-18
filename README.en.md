@@ -15,7 +15,14 @@ Any device that exposes an **RTSP address** can be added — IP cameras, NVRs, e
 
 The goal is simple: **turn an old PC into a surveillance recorder**. That's why it records the original stream without re-encoding, renders with a lightweight UI, and keeps memory in the low hundreds of megabytes.
 
-![CamNexus main window](assets/screenshot.png)
+---
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Main window](assets/shot-main-en.png) | ![Recording settings](assets/shot-record-en.png) |
+| ![Scanning the LAN](assets/shot-scan-en.png) | ![Guided tour](assets/shot-tour-en.png) |
 
 ---
 
@@ -39,6 +46,7 @@ The goal is simple: **turn an old PC into a surveillance recorder**. That's why 
 - **Recovers on its own** — network failures are retried indefinitely (30 s ceiling). Power loss, a switch reboot or a camera restart all heal by themselves
 - **Records only when there is a picture** — an offline camera never starts a segment, so no empty files and no wasted retries
 - **Storage cap** — 500 GB by default; the oldest files are deleted first, and the cap never exceeds the free disk space
+- **Event recording** — records only when someone or something is there, writing nothing while idle; see [below](#event-recording-optional)
 - **Playback** — built-in player, browsable by date and channel
 - **Snapshots** — save the current frame as an image
 
@@ -65,16 +73,17 @@ The goal is simple: **turn an old PC into a surveillance recorder**. That's why 
 
 ### Interface
 
-- Simplified Chinese / English
+- Simplified Chinese / English, **selectable on the first screen of the tour** — the rest of the guide follows immediately
 - Dark and light themes
-- First-run guided tour
-- Configurable data bar in the top bar
+- An 11-step guided tour on first run, from the data bar down to the recording modes; replay it any time from the button at the bottom of Settings
+- Configurable data bar: tick as many items as you like — the menu stays open until you click elsewhere
 
 ### Experimental (off by default)
 
 - **Person / vehicle detection** — draws boxes on the picture, but only around targets that are **moving**: a parked car or someone standing still will not keep a box.
   The toggle is remembered: after a restart — or a crash the watchdog recovers from — detection comes back the way you left it, so event recording keeps working.
   It needs a separate model download, runs on CPU or GPU, and samples at 1–25 FPS (10 on CPU, 25 on GPU) with an on-screen load estimate; it is heavy for older machines, so it stays off unless you turn it on.
+- **Boxes and triggers are not the same thing**: only moving targets get a box, but event recording is looser — a person counts while present (even standing still), while vehicles and bikes have to be moving.
 
 ---
 
@@ -88,7 +97,7 @@ The goal is simple: **turn an old PC into a surveillance recorder**. That's why 
 | GPU | Not required; integrated or discrete graphics can enable hardware decoding |
 | Network | Same LAN as the cameras |
 
-**FFmpeg is not required up front** — the app downloads it on first launch and then checks that it actually runs (one `-version` call), storing it under `%LOCALAPPDATA%\CamNexus`.
+**FFmpeg is not required up front** — the app downloads it on first launch, hashing the bytes with SHA-256 as they arrive and only keeping the file once it matches, then runs `-version` to confirm it starts. It lives under `%LOCALAPPDATA%\CamNexus`.
 
 > FFmpeg is invoked as a **separate process**: it is not linked, not bundled and not distributed with this app. It is published under GPLv3, copyright the FFmpeg authors, source at [ffmpeg.org](https://ffmpeg.org).
 
@@ -110,13 +119,13 @@ The goal is simple: **turn an old PC into a surveillance recorder**. That's why 
 ## A quick look at the UI
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│ ● 2/2 online │ 10:42:07 │ ▼2.3 MB/s ⋮   Playback Settings   │  ← top bar (data bar on the left)
-├──────────────────────────────────────────────────────────────┤
-│ ┌───────────┐ ┌───────────┐                                 │
-│ │ Channel 1 │ │ Channel 2 │                                 │  ← video area
-│ └───────────┘ └───────────┘                                 │
-└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│ ● 2/2 online │ 10:42:07 │ ▼2.3 MB/s ⋮   Today Playback … Settings    │
+├──────────────────────────────────────────────────────────────────────┤
+│ ┌───────────┐ ┌───────────┐                                          │
+│ │ Channel 1 │ │ Channel 2 │                                          │
+│ └───────────┘ └───────────┘                                          │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 | What you want | Where |
@@ -173,17 +182,17 @@ Files are organised as `channel / date / time`, and can be opened with any media
 
 The default is **24/7 continuous recording**. Settings → Recording → Recording mode also offers **on event**:
 
-- the camera stays connected, but the picture only lives in **memory** for the last few seconds (10 by default) and is never written to disk
-- when a person or vehicle is detected, the seconds before and after are saved as one clip — with nothing in view, nothing is written
+- the camera stays connected, but the picture only lives in **memory** for the last few seconds (5 by default) and is never written to disk
+- two kinds of trigger: a **person** counts the moment they appear, even standing still; **vehicles and bikes** have to actually move (8% of the frame width per second). Detection boxes jitter by 1–2% on a parked car, so "record whatever is detected" would run all night
+- the seconds around the trigger are saved, and two clips less than 30 seconds apart are joined into one file (adjustable, 0 disables joining)
+- one clip is capped at 10 minutes; it closes there rather than running forever because someone lingers
+- writing stops as soon as the trigger ends — the file handle stays open for a possible continuation, so the idle time never reaches the file
 - clips start on a keyframe, so the "5 seconds before" may run a little longer
 - detection must be enabled first; without it, event recording never triggers
-- clips live in `事件片段/date/channel/`, **kept apart from the continuous recordings**; the replay window
-  switches between the two and opens either folder with one click
-- two clips less than 30 seconds apart are joined into one file (adjustable, 0 disables joining)
+- clips live in `事件片段/date/channel/`, **kept apart from the continuous recordings**; the replay window switches between the two
 
 The upside is no disk writes while idle, which suits both spinning disks and SSDs.
-The trade-off: clips are shorter than continuous recording and depend on detection accuracy.
-If you would rather miss nothing, stay on 24/7.
+The trade-off: it depends on detection accuracy. If you would rather miss nothing, stay on 24/7.
 
 ---
 
@@ -255,6 +264,10 @@ The **"Today's events"** button on the main window parses today's log into a rep
 each channel recorded, when something moved, how long each event lasted — plus one-click access
 to the folders.
 
+Each clip carries one of three states: **saved**, **in progress** (being written right now), or
+**interrupted** (the app exited mid-clip — the file is there but unfinished). If you restarted the
+app during the day, those clips are labelled "interrupted" instead of hanging on "in progress" forever.
+
 
 ---
 
@@ -299,6 +312,8 @@ Using these models in a closed-source commercial product or service requires a c
 
 The weights carry their own licence field (`license = AGPL-3.0 License`), so you can verify it directly.
 You can delete them at any time from Settings; they live in `%LOCALAPPDATA%\CamNexus\models`.
+
+The same table is shown inside the app under **About**, together with the version you are running and the model currently in use.
 
 ---
 

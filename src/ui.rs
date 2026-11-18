@@ -484,6 +484,22 @@ impl CamNexusApp {
                             );
                         }
                     });
+                    // 第一步先让用户选语言：后面的讲解就是按这个语言显示的
+                    if step_id == StepId::Welcome {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(tr("引导语言")).size(11.5).color(p.muted),
+                            );
+                            let cur = crate::i18n::lang();
+                            for l in [crate::i18n::Lang::Zh, crate::i18n::Lang::En] {
+                                if ui.selectable_label(cur == l, l.label()).clicked() && cur != l {
+                                    action = TourAction::SetLang(l);
+                                }
+                            }
+                        });
+                        ui.add_space(8.0);
+                    }
+
                     ui.add_space(4.0);
                     ui.label(egui::RichText::new(step_title).size(16.0).strong().color(p.text));
                     ui.add_space(8.0);
@@ -574,6 +590,13 @@ impl CamNexusApp {
                     t.goto(StepId::Done);
                 }
                 self.enter_step();
+            }
+            TourAction::SetLang(l) => {
+                self.cfg.lang = l;
+                crate::i18n::set_lang(l);
+                apply_window_title(ctx);
+                // 语言是长期偏好，立刻落盘；其余设置不动
+                let _ = self.cfg.save();
             }
             TourAction::Finish | TourAction::Exit => self.end_tour(),
         }
@@ -1483,7 +1506,12 @@ impl CamNexusApp {
     ///
     /// 一个圆角矩形包住若干指标，右端三点打开勾选面板。
     /// 返回 `Some(新配置)` 表示用户刚改过勾选项，由调用方落盘。
-    fn data_bar(&self, ui: &mut egui::Ui) -> Option<crate::config::BarCfg> {
+    /// 返回（勾选项变化, 自身矩形）。
+    ///
+    /// 矩形给新手引导做高亮用。这里不直接写 `self.anchors`：
+    /// `Sides` 的左右两个闭包同时对 `self` 有借用，一个要 &mut 就会打架。
+    fn data_bar(&self, ui: &mut egui::Ui) -> (Option<crate::config::BarCfg>, Option<egui::Rect>) {
+        let anchor_start = ui.min_rect().min;
         let p = self.pal();
         let bar = self.cfg.bar;
         let (live, total) = self.online_count();
@@ -1691,12 +1719,16 @@ impl CamNexusApp {
             ui.checkbox(&mut next.mem, tr("内存占用"));
         });
 
+        let end = ui.min_rect();
+        let rect = (end.width() > 1.0)
+            .then(|| egui::Rect::from_min_max(anchor_start, end.max));
+
         let changed = next.online != bar.online
             || next.clock != bar.clock
             || next.net != bar.net
             || next.cpu != bar.cpu
             || next.mem != bar.mem;
-        if changed { Some(next) } else { None }
+        (if changed { Some(next) } else { None }, rect)
     }
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
@@ -1713,12 +1745,15 @@ impl CamNexusApp {
         let mut toggle_detect = false;
         let mut bar_change: Option<crate::config::BarCfg> = None;
 
+        let mut bar_rect: Option<egui::Rect> = None;
         egui::containers::Sides::new().height(36.0).show(
             ui,
             |ui| {
-                if let Some(nb) = self.data_bar(ui) {
-                    bar_change = Some(nb);
+                let (nb, rect) = self.data_bar(ui);
+                if nb.is_some() {
+                    bar_change = nb;
                 }
+                bar_rect = rect;
 
                 if let Some(i) = self.audio_idx {
                     ui.add_space(10.0);
@@ -1802,6 +1837,20 @@ impl CamNexusApp {
                 }
             },
         );
+
+        if let Some(r) = bar_rect {
+            // 整体上移 5px（min_rect 把行距也框进来了），上边线再单独抬 6px：
+            // 数据栏的文字视觉重心偏上，框贴着文字才顺眼，左右和下边保持不动
+            const TOP_TRIM: f32 = 6.0;
+            let shifted = r.translate(egui::vec2(0.0, -5.0));
+            self.anchors.insert(
+                crate::tour::anchor::DATA_BAR,
+                egui::Rect::from_min_max(
+                    egui::pos2(shifted.left(), shifted.top() - TOP_TRIM),
+                    shifted.max,
+                ),
+            );
+        }
 
         // 数据栏勾选项变了就立刻存盘，下次启动保持一致
         if let Some(nb) = bar_change {
@@ -5350,6 +5399,7 @@ enum TourAction {
     GotoDone,
     Finish,
     Exit,
+    SetLang(crate::i18n::Lang),
 }
 
 /// 把「屏幕减去高亮矩形」拆成最多 4 条遮罩带
