@@ -210,47 +210,6 @@ Got a spare Android phone? Install [CamNexusRTSP](https://github.com/oywq00008-c
 
 ---
 
-## FAQ
-
-**No sound?**
-
-Run `camnexus.exe --audio-test 1` (the number is the channel index). It reports whether the channel carries an audio track and whether samples actually arrive — enough to tell "this camera has no microphone" apart from "the stream failed".
-
-**A camera won't connect.**
-
-Check three things: the address is complete, the credentials are correct, and RTSP is enabled on the device. On Hikvision and Dahua devices the *device account* and the *ONVIF account* are separate — being able to log into the web UI does not mean RTSP will accept the same login.
-
-**The picture is a narrow strip with black bars.**
-
-The stream itself is probably portrait video padded into a landscape frame. Right-click → **Trim black borders**, then rotate 90°.
-
-**Does it recover after a power cut or a network drop?**
-
-Yes. Streams reconnect with a 1→2→4→8→10 second backoff, and recording retries network errors indefinitely with a 30 second ceiling, resuming as soon as the camera is back. With **start with Windows + process watchdog** enabled, the app itself comes back after a reboot and carries on recording.
-
-**What happens if I launch it twice?**
-
-The second copy exits immediately. A single-instance lock keeps exactly one process running — two copies would exhaust the camera's connection limit.
-
-**Recordings take too much space.**
-
-By default the camera's own bitstream is stored. To save space, lower the bitrate on the camera or in the phone app, or pick a lower recording quality (that re-encodes and costs CPU).
-
-**Which cameras are supported?**
-
-Any device with a standard RTSP URL. Hikvision, Dahua, Uniview, TP-LINK and similar brands work; on Android you can use [CamNexusRTSP](https://github.com/oywq00008-cell/CamNexus-RTSP) to serve the phone camera as a stream.
-
-**Does it need internet access?**
-
-Only for the initial FFmpeg download. After that it runs fully offline.
-
-**Antivirus flags it as suspicious.**
-
-The executable isn't code-signed, and some scanners flag unsigned binaries. You can build it yourself from source, or whitelist it.
-
-
----
-
 ## Log and daily report
 
 Logs live in `%LOCALAPPDATA%\CamNexus\logs\`, one Markdown file per day, recording:
@@ -292,6 +251,66 @@ When something is off, these print far more than a screenshot would:
 On first run a `config.json` is created next to the executable. All settings live there (including camera passwords — don't share it). Delete it to reset to defaults.
 
 `config.example.json` in the repository is a template you can refer to.
+
+---
+
+## FAQ
+
+**No sound?**
+
+Run `camnexus.exe --audio-test 1` (the number is the channel index). It reports whether the channel carries an audio track and whether samples actually arrive — enough to tell "this camera has no microphone" apart from "the stream failed".
+
+**A camera won't connect.**
+
+Check three things: the address is complete, the credentials are correct, and RTSP is enabled on the device. On Hikvision and Dahua devices the *device account* and the *ONVIF account* are separate — being able to log into the web UI does not mean RTSP will accept the same login.
+
+**The picture is a narrow strip with black bars.**
+
+The stream itself is probably portrait video padded into a landscape frame. Right-click → **Trim black borders**, then rotate 90°.
+
+**Does it recover after a power cut or a network drop?**
+
+Yes. Streams reconnect with a 1→2→4→8→10 second backoff, and recording retries network errors indefinitely with a 30 second ceiling, resuming as soon as the camera is back. With **start with Windows + process watchdog** enabled, the app itself comes back after a reboot and carries on recording.
+
+**What happens if I launch it twice?**
+
+The second copy exits immediately. A single-instance lock keeps exactly one process running — two copies would exhaust the camera's connection limit.
+
+**Recordings take too much space.**
+
+Three options: switch to **event recording** so the disk is only written when someone is there; lower the bitrate on the camera or in the phone app; or pick a lower recording quality (that re-encodes and costs CPU).
+
+**Event recording is on, but nothing gets recorded.**
+
+Check three things in order: (1) is **detection** enabled under Settings → Experimental? Without it, event recording never triggers; (2) has the model finished downloading; (3) is the target too small — anything under 8% of the frame width is essentially invisible to a 640-input model, and lowering the display resolution makes distant targets bigger. Also note that **vehicles have to be moving**; a parked car does not trigger.
+
+**Why are event clips only ten-odd seconds long?**
+
+Event recording keeps only the trigger window and stops writing the moment it ends, so idle time never reaches the file. Want longer clips? Raise "keep recording after the trigger" in Settings → Recording, or go back to 24/7.
+
+**What does "interrupted" mean in Today's events?**
+
+That clip was cut off when the app exited (shutdown, crash, task kill). The file is still there and plays up to the break, it just has no ending. If it happens often, check whether security software is terminating the process.
+
+**Why do boxes only appear on moving targets?**
+
+Boxes and triggers are two different rules. Only **moving** targets get a box, so a parked car does not keep one forever; but event recording is looser — a person counts while present, even standing still. So "recording, but nobody is boxed" is normal.
+
+**Which cameras are supported?**
+
+Any device with a standard RTSP URL. Hikvision, Dahua, Uniview, TP-LINK and similar brands work; on Android you can use [CamNexusRTSP](https://github.com/oywq00008-cell/CamNexus-RTSP) to serve the phone camera as a stream.
+
+**Does it need internet access?**
+
+For the initial FFmpeg download, and for the model download if you use detection. After that it runs fully offline.
+
+**I'm upgrading — do my config and recordings survive?**
+
+Yes. Overwrite the old `camnexus.exe`; `config.json` and the recording folders are untouched, and new settings take their defaults. Older event clips show estimated durations under "Today" (early logs had no real seconds); new ones are exact.
+
+**Antivirus flags it as suspicious.**
+
+The executable isn't code-signed, and some scanners flag unsigned binaries. You can build it yourself from source, or whitelist it.
 
 ---
 
@@ -339,3 +358,17 @@ CamNexus does not bundle or redistribute FFmpeg; it is downloaded on the user's 
 The app runs FFmpeg from the command line (a separate process, no library linking) using a GPLv3 build. FFmpeg is copyright its authors and published under GPLv3; source at [ffmpeg.org](https://ffmpeg.org).
 
 > If you repackage this app together with a downloaded `ffmpeg.exe` and pass it on, **that redistribution** has to comply with GPLv3 (ship the licence text and an offer of source). Distributing the app alone and letting the recipient download FFmpeg for themselves avoids this.
+
+### Detection models
+
+The models are standalone data files: not linked into the binary, not distributed with this app, downloaded by the user:
+
+| Model | Licence | Notes |
+|---|---|---|
+| YOLOX-s | **Apache-2.0** | Permissive and commercial-friendly; keep the copyright and licence notice |
+| YOLO26n / l / x | **AGPL-3.0** | Published by [Ultralytics](https://ultralytics.com); a commercial licence is required for closed-source products or services |
+
+- Copyright in the weights stays with their authors; this app only loads and runs them
+- Before the first download you must read the licence notice and tick the box — without that, neither downloading nor enabling detection is possible
+- The weights carry their own `license` field, so you can verify it directly
+- AGPL also imposes source-availability terms when the work is **offered as a network service**. This app loads the weights as data files and does not link Ultralytics code; if you plan to expose detection as a service, assess the obligation against the licence text and, where it matters, take legal advice.
