@@ -12,7 +12,6 @@ use crate::i18n::{self, tr};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use crate::config::DetectCfg;
 
 /// 只关心这几类（COCO id → 中文名）
 const CLASSES: &[(usize, &str)] = &[
@@ -46,6 +45,28 @@ pub struct Detector {
     night_opt: bool,
     /// CLAHE 用的亮度缓冲
     luma: Vec<u8>,
+    /// 上一次填过的 letterbox 几何。填充区只与宽高比有关，
+    /// 几何没变就不必每帧把那 640×640×3 个位置再写一遍。
+    padded_geom: Option<(usize, usize, usize, usize)>,
+}
+
+
+/// 推理内部使用的线程数。
+///
+/// 一次推理是「一层卷积算完算下一层」，天然可以在层内并行，ORT 用
+/// intra-op 线程池做这件事——**不是**每个通道一个线程。实测 yolo26n 在
+/// 8 核 16 线程的机器上跑一次推理会吃掉 5 个多物理核，本来就没「只用一个核」。
+///
+/// 这里把线程数显式定下来，是因为 ORT 默认取「物理核数」，
+/// 而 std 只能拿到逻辑核（含超线程）：
+/// - 双核/四核的老机器 → 各自用满 2 / 4，不会退化成单线程；
+/// - 8 核 16 线程 → 上限 8，而不是 16 个线程抢 8 个物理核（超线程对卷积是负收益，
+///   多出来的调度开销还会挤占解码和写盘）。
+fn intra_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8)
 }
 
 /// 进程级 ONNX Runtime 环境。
@@ -93,6 +114,17 @@ impl Detector {
                 Err(_) => builder = new_builder()?,
             }
         }
+        // 线程数按机器给；设置失败就退回默认（不影响功能，只是没那么确定）。
+        // 分开写而不是 and_then：闭包里的 Err 变体太大，clippy 会告警。
+        let mut builder = match builder.with_intra_threads(intra_threads()) {
+            Ok(b) => b,
+            Err(_) => new_builder()?,
+        };
+        // 同一时刻只有一个推理在跑，inter-op 不需要额外并行
+        builder = match builder.with_inter_threads(1) {
+            Ok(b) => b,
+            Err(_) => new_builder()?,
+        };
         let session = builder
             .commit_from_file(model)
             .map_err(|e| i18n::err(tr("加载模型失败"), e))?;
@@ -103,6 +135,7 @@ impl Detector {
             chw: vec![0.0; 3 * input * input],
             night_opt: false,
             luma: Vec::new(),
+            padded_geom: None,
         })
     }
 
@@ -135,28 +168,54 @@ impl Detector {
         let dy = (size - nh) / 2;
         let pad = 114.0 / 255.0;
 
-        self.chw.fill(pad);
+        // 填充区（上下黑边 + 每行左右留白）只跟画面宽高比有关，内容区每帧都被
+        // 整块覆盖。几何没变时跳过填充——那是 640×640×3 次写入。
+        let geom = (nw, nh, dx, dy);
+        if self.padded_geom != Some(geom) {
+            self.chw.fill(pad);
+            self.padded_geom = Some(geom);
+        }
+
+        // 缩小超过 2 倍时（例如直接吃 2560×1440 的画面）单点取样会整行整列地丢，
+        // 换成 2×2 四采样平均；1.5 倍这类小幅缩放仍走单点，省时间。
+        let wide = r < 0.5;
         let c_plane = size * size;
         for ty in 0..nh {
             let sy = ((ty as f32) / r) as usize;
             if sy >= h {
                 break;
             }
+            let sy2 = if wide { (sy + 1).min(h - 1) } else { sy };
             for tx in 0..nw {
                 let sx = ((tx as f32) / r) as usize;
                 if sx >= w {
                     break;
                 }
-                let si = (sy * w + sx) * 3;
+                let p00 = (sy * w + sx) * 3;
+                let px = if wide {
+                    let sx2 = (sx + 1).min(w - 1);
+                    let p01 = (sy * w + sx2) * 3;
+                    let p10 = (sy2 * w + sx) * 3;
+                    let p11 = (sy2 * w + sx2) * 3;
+                    let avg = |o: usize| {
+                        (rgb[p00 + o] as u16
+                            + rgb[p01 + o] as u16
+                            + rgb[p10 + o] as u16
+                            + rgb[p11 + o] as u16) as f32
+                            / (4.0 * 255.0)
+                    };
+                    [avg(0), avg(1), avg(2)]
+                } else {
+                    [
+                        rgb[p00] as f32 / 255.0,
+                        rgb[p00 + 1] as f32 / 255.0,
+                        rgb[p00 + 2] as f32 / 255.0,
+                    ]
+                };
                 let di = (dy + ty) * size + (dx + tx);
-                let v = [
-                    rgb[si] as f32 / 255.0,
-                    rgb[si + 1] as f32 / 255.0,
-                    rgb[si + 2] as f32 / 255.0,
-                ];
-                self.chw[di] = v[0];
-                self.chw[c_plane + di] = v[1];
-                self.chw[2 * c_plane + di] = v[2];
+                self.chw[di] = px[0];
+                self.chw[c_plane + di] = px[1];
+                self.chw[2 * c_plane + di] = px[2];
             }
         }
 
@@ -173,12 +232,39 @@ impl Detector {
             .try_extract_array::<f32>()
             .map_err(|e| i18n::err(tr("读取输出失败"), e))?;
 
-        // [1, N, 85] → 逐行解码
-        let rows = out.shape()[1];
-        let cols = out.shape()[2];
+        // 输出有两种常见形态，按最后一维判定：
+        //   [1, N, 85]  YOLOX：网格单位，需要解码 + NMS
+        //   [1, 300, 6] YOLO26 / YOLOv10 的端到端头：已是最终框，不需要 NMS
+        let shape = out.shape();
+        if shape.len() != 3 {
+            return Err(tr("模型输出维度不支持").into());
+        }
+        let rows = shape[1];
+        let cols = shape[2];
         let data = out.as_slice().ok_or(tr("输出内存不连续"))?;
+        let e2e = cols == 6;
 
         let mut cands: Vec<(f32, usize, [f32; 4])> = Vec::new(); // score, class, xywh(px)
+
+        if e2e {
+            // 端到端头：每行 [x1, y1, x2, y2, 置信度, 类别]，坐标已是输入图像素
+            for i in 0..rows {
+                let b = i * 6;
+                let score = data[b + 4];
+                if score < thr {
+                    continue;
+                }
+                let cls = data[b + 5] as usize;
+                if !CLASSES.iter().any(|(id, _)| *id == cls) {
+                    continue;
+                }
+                let (x1, y1, x2, y2) = (data[b], data[b + 1], data[b + 2], data[b + 3]);
+                if x2 <= x1 || y2 <= y1 {
+                    continue;
+                }
+                cands.push((score, cls, [x1, y1, x2 - x1, y2 - y1]));
+            }
+        } else {
         let mut offset = 0usize;
         for &s in &self.strides {
             let g = size / s;
@@ -220,19 +306,26 @@ impl Detector {
             }
             offset += cells;
         }
-        let _ = rows;
+        } // end YOLOX 分支
 
-        // 贪心 NMS
-        cands.sort_by(|a, b| b.0.total_cmp(&a.0));
-        let mut keep: Vec<(f32, usize, [f32; 4])> = Vec::new();
-        for c in cands {
-            if keep.iter().all(|k| iou(&k.2, &c.2) < 0.45) {
-                keep.push(c);
+        // 贪心 NMS。端到端头已经做过抑制，直接用它的输出。
+        let keep: Vec<(f32, usize, [f32; 4])> = if e2e {
+            cands.sort_by(|a, b| b.0.total_cmp(&a.0));
+            cands.truncate(32);
+            cands
+        } else {
+            cands.sort_by(|a, b| b.0.total_cmp(&a.0));
+            let mut keep: Vec<(f32, usize, [f32; 4])> = Vec::new();
+            for c in cands {
+                if keep.iter().all(|k| iou(&k.2, &c.2) < 0.45) {
+                    keep.push(c);
+                }
+                if keep.len() >= 32 {
+                    break;
+                }
             }
-            if keep.len() >= 32 {
-                break;
-            }
-        }
+            keep
+        };
 
         // 映射回原图并归一化
         let mut out_v = Vec::with_capacity(keep.len());
@@ -286,145 +379,7 @@ pub fn find_model(name: &str) -> Option<PathBuf> {
     cands.into_iter().find(|p| p.is_file())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
 
-    /// ONNX Runtime 环境必须是进程级单例：第二次 build 会直接失败，
-    /// 一旦失败推理线程就退出，界面上表现为「切显卡/CPU 后识别开关打不开」。
-    #[test]
-    fn environment_is_a_process_singleton() {
-        let a = shared_env().expect("第一次初始化应该成功");
-        let b = shared_env().expect("第二次必须复用同一个环境，不能报错");
-        assert!(std::ptr::eq(a, b), "两次拿到的应是同一个 Environment");
-    }
-
-    /// 手动检查（需要模型 + 显卡）：真机验证「先显卡、再切 CPU」能连续加载。
-    /// 跑法：cargo test -- --ignored probe
-    #[test]
-    #[ignore]
-    fn probe_gpu_then_cpu() {
-        let Some(path) = find_model("yolox_s.onnx") else {
-            println!("没有模型文件，跳过");
-            return;
-        };
-        Detector::load_with(&path, 640, true).expect("显卡模式应能加载");
-        Detector::load_with(&path, 640, false).expect("切到 CPU 后应能加载");
-        Detector::load_with(&path, 640, true).expect("再切回显卡应能加载");
-    }
-
-
-    /// 回归：通道 1 的目标不许出现在通道 2 上。
-    ///
-    /// 曾经所有通道共用一份 Tracker，`update()` 会把「本帧没匹配上但还没到丢失上限」
-    /// 的轨迹一并输出，于是 A 的框被画到了 B 的画面上。
-    #[test]
-    fn tracks_never_leak_between_channels() {
-        let cfg = DetectCfg::default(); // 静止豁免 60 秒
-        let mut ts = Trackers::new(&cfg);
-        let now = Instant::now();
-        let person = Detection {
-            label: "人",
-            score: 0.9,
-            x: 0.1,
-            y: 0.1,
-            w: 0.1,
-            h: 0.2,
-        };
-
-        // 通道 0 连续两帧看到人 → 达到 hits ≥ 2，开始输出
-        assert!(ts.update(0, &[person], now).is_empty(), "第一帧只登记不显示");
-        assert_eq!(ts.update(0, &[person], now).len(), 1, "通道 0 应输出目标");
-
-        // 通道 1 一个人都没有 → 绝不能冒出通道 0 的框
-        let out = ts.update(1, &[], now);
-        assert!(out.is_empty(), "通道 1 不该看到通道 0 的目标，实际 {:?}", out.len());
-
-        // 真实时序是两路交替来帧：通道 0 每帧都有人，通道 1 每帧都空。
-        // 共用 Tracker 时，通道 0 的轨迹会被通道 1 的「空帧」判成丢失，
-        // 但丢失不足 3 帧仍会输出，于是交替跑下去通道 1 永远在显示别人的框。
-        for _ in 0..8 {
-            assert_eq!(ts.update(0, &[person], now).len(), 1, "通道 0 应一直有人");
-            assert!(
-                ts.update(1, &[], now).is_empty(),
-                "交替提交时通道 1 也必须保持干净"
-            );
-        }
-
-        // 通道 0 自己那份还在（这是防闪框的平滑，属于正常行为）
-        assert_eq!(ts.update(0, &[person], now).len(), 1);
-    }
-
-    /// 空闲通道的跟踪器会被回收，删通道后不会无限堆积
-    #[test]
-    fn idle_channel_trackers_are_pruned() {
-        let cfg = DetectCfg::default();
-        let mut ts = Trackers::new(&cfg);
-        let now = Instant::now();
-        let det = Detection {
-            label: "车",
-            score: 0.9,
-            x: 0.1,
-            y: 0.1,
-            w: 0.2,
-            h: 0.2,
-        };
-        ts.update(0, &[det], now);
-        ts.update(1, &[det], now);
-        assert_eq!(ts.map.len(), 2);
-        // 11 分钟后再来一帧，只有正在用的那路留下
-        ts.update(0, &[det], now + std::time::Duration::from_secs(660));
-        assert_eq!(ts.map.len(), 1, "超过 10 分钟没帧的通道应被回收");
-    }
-
-    #[test]
-    fn iou_basic() {
-        let a = [0.0, 0.0, 10.0, 10.0];
-        assert!((iou(&a, &a) - 1.0).abs() < 1e-6);
-        let b = [20.0, 20.0, 10.0, 10.0];
-        assert_eq!(iou(&a, &b), 0.0);
-        let c = [5.0, 0.0, 10.0, 10.0];
-        assert!((iou(&a, &c) - 1.0 / 3.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn tracker_hides_static_after_grace() {
-        let cfg = DetectCfg {
-            static_grace_secs: 1,
-            ..Default::default()
-        };
-        let mut t = Tracker::new(&cfg);
-        let det = Detection { label: "车", score: 0.9, x: 0.1, y: 0.1, w: 0.2, h: 0.2 };
-        let now = Instant::now();
-        // 第一帧只登记，不显示（要求连续两帧）
-        assert!(t.update(&[det], now).is_empty());
-        // 第二帧仍然显示
-        assert_eq!(t.update(&[det], now + std::time::Duration::from_millis(500)).len(), 1);
-        // 超过豁免时长且没动 → 隐藏
-        assert!(t.update(&[det], now + std::time::Duration::from_secs(2)).is_empty());
-        // 小幅度移动（真实场景里车是一点点挪的）→ 立刻恢复显示
-        let moved = Detection { x: 0.32, ..det };
-        assert_eq!(t.update(&[moved], now + std::time::Duration::from_secs(3)).len(), 1);
-    }
-
-    #[test]
-    fn tracker_zero_grace_never_hides() {
-        let cfg = DetectCfg {
-            static_grace_secs: 0,
-            ..Default::default()
-        };
-        let mut t = Tracker::new(&cfg);
-        let det = Detection { label: "人", score: 0.8, x: 0.1, y: 0.1, w: 0.1, h: 0.2 };
-        let now = Instant::now();
-        t.update(&[det], now);
-        assert_eq!(t.update(&[det], now + std::time::Duration::from_secs(600)).len(), 1);
-    }
-
-    #[test]
-    fn only_person_and_vehicle_kept() {
-        assert!(CLASSES.iter().all(|(id, _)| matches!(id, 0 | 1 | 2 | 3 | 5 | 7)));
-    }
-}
 
 // ---------------------------------------------------------------- 夜视优化（CLAHE）
 /// 对亮度做 CLAHE（限制对比度的自适应直方图均衡），再按增益回写 RGB。
@@ -524,14 +479,22 @@ fn clahe_rgb(rgb: &[u8], w: usize, h: usize, luma_buf: &mut Vec<u8>) -> Vec<u8> 
     out
 }
 
-// ---------------------------------------------------------------- 静止物体豁免
+// ---------------------------------------------------------------- 运动筛选
 /// 一条目标轨迹
 pub struct Track {
     pub label: &'static str,
     pub score: f32,
     /// 归一化框
     pub rect: [f32; 4],
-    last_move: Instant,
+    /// 最后一次被判定为"在动"的时刻；从没动过是 None
+    moved_at: Option<Instant>,
+    /// 平滑后的中心点与线性尺寸，压掉框抖动
+    smooth: (f32, f32),
+    smooth_size: f32,
+    /// 上一个评估窗口的基准位置
+    anchor: (f32, f32),
+    anchor_size: f32,
+    anchor_at: Instant,
     hits: u32,
     missed: u32,
 }
@@ -545,26 +508,56 @@ impl Track {
     }
 }
 
-/// 轻量跟踪器：按 IoU 关联，位移小视为静止；静止超时后不再输出
+/// 判定「在动」的最小速度：归一化画面宽度/秒。
+///
+/// 取值依据：正常行走横穿 10 米宽的视野约 14%/秒，远高于此；而检测框的
+/// 逐帧抖动通常不到 1%，按窗口平均后更低。3% 正好把两者分开。
+const SPEED_EPS: f32 = 0.03;
+
+/// 触发事件录像所需的最小速度（归一化宽度/秒）。
+///
+/// 比画框的 3%/秒 严格得多：画框错一下只是多个框，触发错一下就是整段录像。
+/// 停着的摩托、被风吹的树，检测框边缘有 1~2% 的抖动，按 3% 判定会被当成
+/// 在动，一晚上能触发几十次。正常行走横穿视野约 10~15%/秒，取 8% 两者分得开。
+pub const TRIGGER_SPEED: f32 = 0.08;
+/// 判定「在动」的最小尺寸变化率（线性，每秒）。
+/// 朝着镜头走过来时中心点几乎不动，但框会持续变大，只看位移会漏掉。
+const SCALE_EPS: f32 = 0.08;
+/// 目标停住后还画这么久，避免一停就闪掉
+const MOVE_HOLD: std::time::Duration = std::time::Duration::from_millis(2000);
+/// 平滑系数：新观测占多少。越小越稳，越大越跟手
+const SMOOTH_ALPHA: f32 = 0.5;
+/// 速度评估窗口。
+///
+/// **不能逐帧算**：检测框的抖动幅度不随帧率变小，帧率越高、相邻两帧的
+/// 时间越短，算出来的速度反而越大——静止目标会被当成在跑。
+/// 按固定时间窗口比较「现在的平滑位置」和「一个窗口前的平滑位置」，
+/// 抖动在窗口内相互抵消，真实位移则完整保留。
+const MOVE_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// 轻量跟踪器：按 IoU/中心距关联，只输出「最近在动」的目标。
+///
+/// 按需求不再检测静止物体：一辆停了整晚的车、一个站着不动的人，都不会画框；
+/// 一旦移动立刻恢复。
 pub struct Tracker {
     tracks: Vec<Track>,
-    /// 判定「动了」的最小位移（归一化，约等于画面宽度的 1.5%）
-    move_eps: f32,
-    /// 静止多久后隐藏
-    grace_secs: u32,
+    /// 本轮跟踪里最快的那条轨迹（归一化宽度/秒）。
+    /// 触发用它，而不是「有没有动」——判定阈值 3%/秒 对画框够用，
+    /// 但对触发太松：一辆停着的摩托，框边缘抖动就能越过它。
+    last_speed: f32,
 }
 
 impl Tracker {
-    pub fn new(cfg: &DetectCfg) -> Self {
+    pub fn new() -> Self {
         Self {
             tracks: Vec::new(),
-            move_eps: 0.015,
-            grace_secs: cfg.static_grace_secs,
+            last_speed: 0.0,
         }
     }
 
     /// 输入本帧检测结果，返回应当显示的目标
     pub fn update(&mut self, dets: &[Detection], now: Instant) -> Vec<Detection> {
+        self.last_speed = 0.0;
         let mut used = vec![false; self.tracks.len()];
 
         for d in dets {
@@ -589,24 +582,51 @@ impl Tracker {
                 Some((i, _)) => {
                     used[i] = true;
                     let t = &mut self.tracks[i];
-                    let (cx, cy) = t.center();
                     let ncx = d.x + d.w / 2.0;
                     let ncy = d.y + d.h / 2.0;
-                    let moved = (ncx - cx).abs() > self.move_eps || (ncy - cy).abs() > self.move_eps;
-                    if moved {
-                        t.last_move = now;
+
+                    // 先平滑：抖动是零均值的，平滑后被抵消，真实位移保留
+                    t.smooth = (
+                        t.smooth.0 * (1.0 - SMOOTH_ALPHA) + ncx * SMOOTH_ALPHA,
+                        t.smooth.1 * (1.0 - SMOOTH_ALPHA) + ncy * SMOOTH_ALPHA,
+                    );
+                    t.smooth_size =
+                        t.smooth_size * (1.0 - SMOOTH_ALPHA) + (d.w * d.h).sqrt() * SMOOTH_ALPHA;
+
+                    // 到一个完整窗口才评估一次速度
+                    if now.duration_since(t.anchor_at) >= MOVE_WINDOW {
+                        let dt = now.duration_since(t.anchor_at).as_secs_f32().max(1e-3);
+                        let v = (t.smooth.0 - t.anchor.0).hypot(t.smooth.1 - t.anchor.1) / dt;
+                        let scale_rate =
+                            ((t.smooth_size / t.anchor_size.max(1e-6)) - 1.0).abs() / dt;
+                        self.last_speed = self.last_speed.max(v);
+                        if v > SPEED_EPS || scale_rate > SCALE_EPS {
+                            t.moved_at = Some(now);
+                        }
+                        t.anchor = t.smooth;
+                        t.anchor_size = t.smooth_size;
+                        t.anchor_at = now;
                     }
+
                     t.rect = [d.x, d.y, d.w, d.h];
                     t.score = d.score;
                     t.hits = t.hits.saturating_add(1);
                     t.missed = 0;
                 }
                 None => {
+                    let cx = d.x + d.w / 2.0;
+                    let cy = d.y + d.h / 2.0;
+                    let size = (d.w * d.h).sqrt();
                     self.tracks.push(Track {
                         label: d.label,
                         score: d.score,
                         rect: [d.x, d.y, d.w, d.h],
-                        last_move: now,
+                        moved_at: None,
+                        smooth: (cx, cy),
+                        smooth_size: size,
+                        anchor: (cx, cy),
+                        anchor_size: size,
+                        anchor_at: now,
                         hits: 1,
                         missed: 0,
                     });
@@ -623,18 +643,16 @@ impl Tracker {
         }
         self.tracks.retain(|t| t.missed < 3);
 
-        // 只输出「稳定存在且未静止超时」的目标
-        let grace = self.grace_secs;
+        // 只输出「稳定存在且最近在动」的目标
         self.tracks
             .iter()
             .filter(|t| {
                 if t.hits < 2 {
                     return false;
                 }
-                if grace == 0 {
-                    return true;
-                }
-                now.duration_since(t.last_move).as_secs() < grace as u64
+                t.moved_at
+                    .map(|at| now.duration_since(at) <= MOVE_HOLD)
+                    .unwrap_or(false)
             })
             .map(|t| Detection {
                 label: t.label,
@@ -656,18 +674,21 @@ impl Tracker {
 /// 只会变成「丢失 1 帧」，下一帧照样被输出 —— 表现就是 A 的框画到了 B 上。
 pub struct Trackers {
     map: std::collections::HashMap<usize, (Tracker, std::time::Instant)>,
-    cfg: DetectCfg,
 }
 
 impl Trackers {
-    pub fn new(cfg: &DetectCfg) -> Self {
+    pub fn new() -> Self {
         Self {
             map: std::collections::HashMap::new(),
-            cfg: *cfg,
         }
     }
 
     /// 按通道号更新，返回该通道应当显示的目标
+    /// 该通道最近一轮的最大运动速度（归一化宽度/秒）
+    pub fn speed(&self, idx: usize) -> f32 {
+        self.map.get(&idx).map(|(t, _)| t.last_speed).unwrap_or(0.0)
+    }
+
     pub fn update(
         &mut self,
         idx: usize,
@@ -678,11 +699,7 @@ impl Trackers {
         self.map
             .retain(|_, (_, last)| now.duration_since(*last).as_secs() < 600);
 
-        let cfg = self.cfg;
-        let entry = self
-            .map
-            .entry(idx)
-            .or_insert_with(|| (Tracker::new(&cfg), now));
+        let entry = self.map.entry(idx).or_insert_with(|| (Tracker::new(), now));
         entry.1 = now;
         entry.0.update(dets, now)
     }
@@ -695,4 +712,236 @@ fn iou_rect(a: &[f32; 4], b: &[f32; 4]) -> f32 {    let x0 = a[0].max(b[0]);
     let inter = (x1 - x0).max(0.0) * (y1 - y0).max(0.0);
     let union = a[2] * a[3] + b[2] * b[3] - inter;
     if union <= 0.0 { 0.0 } else { inter / union }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ONNX Runtime 环境必须是进程级单例：第二次 build 会直接失败，
+    /// 一旦失败推理线程就退出，界面上表现为「切显卡/CPU 后识别开关打不开」。
+    #[test]
+    fn environment_is_a_process_singleton() {
+        let a = shared_env().expect("第一次初始化应该成功");
+        let b = shared_env().expect("第二次必须复用同一个环境，不能报错");
+        assert!(std::ptr::eq(a, b), "两次拿到的应是同一个 Environment");
+    }
+
+    /// 手动检查（需要模型 + 显卡）：真机验证「先显卡、再切 CPU」能连续加载。
+    /// 跑法：cargo test -- --ignored probe
+    #[test]
+    #[ignore]
+    fn probe_gpu_then_cpu() {
+        let Some(path) = find_model("yolox_s.onnx") else {
+            println!("没有模型文件，跳过");
+            return;
+        };
+        Detector::load_with(&path, 640, true).expect("显卡模式应能加载");
+        Detector::load_with(&path, 640, false).expect("切到 CPU 后应能加载");
+        Detector::load_with(&path, 640, true).expect("再切回显卡应能加载");
+    }
+
+
+    /// 回归：通道 1 的目标不许出现在通道 2 上。
+    ///
+    /// 曾经所有通道共用一份 Tracker，`update()` 会把「本帧没匹配上但还没到丢失上限」
+    /// 的轨迹一并输出，于是 A 的框被画到了 B 的画面上。
+    #[test]
+    fn tracks_never_leak_between_channels() {
+        let mut ts = Trackers::new();
+        let now = Instant::now();
+        let person = Detection {
+            label: "人",
+            score: 0.9,
+            x: 0.1,
+            y: 0.1,
+            w: 0.1,
+            h: 0.2,
+        };
+
+        // 通道 0 看到人在走动 → 判定为运动后才输出（时间必须推进，否则速度窗口不触发）
+        let mut p1 = person;
+        assert!(ts.update(0, &[p1], now).is_empty(), "第一帧只登记不显示");
+        p1.x += 0.05;
+        let t1 = now + std::time::Duration::from_millis(400);
+        assert_eq!(ts.update(0, &[p1], t1).len(), 1, "通道 0 应输出目标");
+        let now = t1;
+
+        // 通道 1 一个人都没有 → 绝不能冒出通道 0 的框
+        let out = ts.update(1, &[], now);
+        assert!(out.is_empty(), "通道 1 不该看到通道 0 的目标，实际 {:?}", out.len());
+
+        // 真实时序是两路交替来帧：通道 0 每帧都有人，通道 1 每帧都空。
+        // 共用 Tracker 时，通道 0 的轨迹会被通道 1 的「空帧」判成丢失，
+        // 但丢失不足 3 帧仍会输出，于是交替跑下去通道 1 永远在显示别人的框。
+        for step in 1..=8u64 {
+            p1.x += 0.05;
+            let at = now + std::time::Duration::from_millis(200 * step);
+            assert_eq!(ts.update(0, &[p1], at).len(), 1, "通道 0 应一直有人");
+            assert!(
+                ts.update(1, &[], at).is_empty(),
+                "交替提交时通道 1 也必须保持干净"
+            );
+        }
+    }
+
+    /// 空闲通道的跟踪器会被回收，删通道后不会无限堆积
+    #[test]
+    fn idle_channel_trackers_are_pruned() {
+        let mut ts = Trackers::new();
+        let now = Instant::now();
+        let det = Detection {
+            label: "车",
+            score: 0.9,
+            x: 0.1,
+            y: 0.1,
+            w: 0.2,
+            h: 0.2,
+        };
+        ts.update(0, &[det], now);
+        ts.update(1, &[det], now);
+        assert_eq!(ts.map.len(), 2);
+        // 11 分钟后再来一帧，只有正在用的那路留下
+        ts.update(0, &[det], now + std::time::Duration::from_secs(660));
+        assert_eq!(ts.map.len(), 1, "超过 10 分钟没帧的通道应被回收");
+    }
+
+    #[test]
+    fn iou_basic() {
+        let a = [0.0, 0.0, 10.0, 10.0];
+        assert!((iou(&a, &a) - 1.0).abs() < 1e-6);
+        let b = [20.0, 20.0, 10.0, 10.0];
+        assert_eq!(iou(&a, &b), 0.0);
+        let c = [5.0, 0.0, 10.0, 10.0];
+        assert!((iou(&a, &c) - 1.0 / 3.0).abs() < 1e-5);
+    }
+
+    /// 静止目标永远不画框（这是需求：只检测运动物体）
+    #[test]
+    fn static_target_is_never_boxed() {
+        let mut t = Tracker::new();
+        let det = Detection {
+            label: "车",
+            score: 0.9,
+            x: 0.1,
+            y: 0.1,
+            w: 0.2,
+            h: 0.2,
+        };
+        let t0 = Instant::now();
+        for ms in [0u64, 200, 400, 800, 2000, 6000] {
+            let out = t.update(&[det], t0 + std::time::Duration::from_millis(ms));
+            assert!(out.is_empty(), "{ms}ms 时静止目标被画框了");
+        }
+    }
+
+    /// 检测框的逐帧抖动不能被当成运动
+    #[test]
+    fn jitter_does_not_count_as_motion() {
+        let mut t = Tracker::new();
+        let base = Detection {
+            label: "人",
+            score: 0.8,
+            x: 0.40,
+            y: 0.40,
+            w: 0.10,
+            h: 0.20,
+        };
+        let t0 = Instant::now();
+        // 抖动 0.5%，每 200ms 一帧，持续 2 秒
+        for step in 0..10u64 {
+            let dx = if step % 2 == 0 { 0.0 } else { 0.005 };
+            let d = Detection { x: base.x + dx, ..base };
+            let out = t.update(&[d], t0 + std::time::Duration::from_millis(200 * step));
+            assert!(out.is_empty(), "第 {step} 帧的抖动被误判成运动");
+        }
+    }
+
+    /// 正常走动的目标要在半秒左右被画出来
+    #[test]
+    fn walking_target_is_boxed() {
+        let mut t = Tracker::new();
+        let mut det = Detection {
+            label: "人",
+            score: 0.8,
+            x: 0.10,
+            y: 0.40,
+            w: 0.10,
+            h: 0.20,
+        };
+        let t0 = Instant::now();
+        // 每 200ms 走 3% 画面宽度 ≈ 15%/秒
+        let mut boxed_at = None;
+        for step in 1..=8u64 {
+            det.x += 0.03;
+            let out = t.update(&[det], t0 + std::time::Duration::from_millis(200 * step));
+            if !out.is_empty() && boxed_at.is_none() {
+                boxed_at = Some(200 * step);
+            }
+        }
+        let ms = boxed_at.expect("走动的目标始终没被画框");
+        assert!(ms <= 800, "画框太慢：第 {ms} ms 才出现");
+    }
+
+    /// 停住之后要保留一会儿再消失，避免一停就闪
+    #[test]
+    fn box_disappears_two_seconds_after_stopping() {
+        let mut t = Tracker::new();
+        let mut det = Detection {
+            label: "人",
+            score: 0.8,
+            x: 0.10,
+            y: 0.40,
+            w: 0.10,
+            h: 0.20,
+        };
+        let t0 = Instant::now();
+        // 先走 1 秒
+        let mut last = t0;
+        for step in 1..=5u64 {
+            det.x += 0.03;
+            last = t0 + std::time::Duration::from_millis(200 * step);
+            t.update(&[det], last);
+        }
+        // 停住 1 秒：仍在保持窗口内
+        assert_eq!(
+            t.update(&[det], last + std::time::Duration::from_millis(1000)).len(),
+            1,
+            "刚停下 1 秒内不该闪掉"
+        );
+        // 停住 3 秒：超过保持窗口
+        assert!(
+            t.update(&[det], last + std::time::Duration::from_millis(3000)).is_empty(),
+            "停住 3 秒后应当消失"
+        );
+    }
+
+    /// 朝着镜头走来：中心几乎不动，靠尺寸变化也要能判定为运动
+    #[test]
+    fn approaching_target_counts_as_moving() {
+        let mut t = Tracker::new();
+        let mut det = Detection {
+            label: "人",
+            score: 0.8,
+            x: 0.40,
+            y: 0.30,
+            w: 0.10,
+            h: 0.20,
+        };
+        let t0 = Instant::now();
+        let mut boxed = false;
+        for step in 1..=8u64 {
+            det.w *= 1.03; // 每步放大 3%
+            det.h *= 1.03;
+            det.x = 0.45 - det.w / 2.0;
+            let out = t.update(&[det], t0 + std::time::Duration::from_millis(200 * step));
+            boxed |= !out.is_empty();
+        }
+        assert!(boxed, "迎面走来的目标始终没被画框");
+    }
+
+    #[test]
+    fn only_person_and_vehicle_kept() {
+        assert!(CLASSES.iter().all(|(id, _)| matches!(id, 0 | 1 | 2 | 3 | 5 | 7)));
+    }
 }

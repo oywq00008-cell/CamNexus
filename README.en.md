@@ -72,7 +72,9 @@ The goal is simple: **turn an old PC into a surveillance recorder**. That's why 
 
 ### Experimental (off by default)
 
-- **Person / vehicle detection** — draws boxes on the picture. Requires a separate model download and can run on CPU or GPU; it's heavy for older machines, so it stays off unless you turn it on.
+- **Person / vehicle detection** — draws boxes on the picture, but only around targets that are **moving**: a parked car or someone standing still will not keep a box.
+  The toggle is remembered: after a restart — or a crash the watchdog recovers from — detection comes back the way you left it, so event recording keeps working.
+  It needs a separate model download, runs on CPU or GPU, and samples at 1–25 FPS (10 on CPU, 25 on GPU) with an on-screen load estimate; it is heavy for older machines, so it stays off unless you turn it on.
 
 ---
 
@@ -166,6 +168,23 @@ Actions
 
 Files are organised as `channel / date / time`, and can be opened with any media player — no dependency on this app.
 
+
+### Event recording (optional)
+
+The default is **24/7 continuous recording**. Settings → Recording → Recording mode also offers **on event**:
+
+- the camera stays connected, but the picture only lives in **memory** for the last few seconds (10 by default) and is never written to disk
+- when a person or vehicle is detected, the seconds before and after are saved as one clip — with nothing in view, nothing is written
+- clips start on a keyframe, so the "5 seconds before" may run a little longer
+- detection must be enabled first; without it, event recording never triggers
+- clips live in `事件片段/date/channel/`, **kept apart from the continuous recordings**; the replay window
+  switches between the two and opens either folder with one click
+- two clips less than 30 seconds apart are joined into one file (adjustable, 0 disables joining)
+
+The upside is no disk writes while idle, which suits both spinning disks and SSDs.
+The trade-off: clips are shorter than continuous recording and depend on detection accuracy.
+If you would rather miss nothing, stay on 24/7.
+
 ---
 
 ## Companion app
@@ -220,6 +239,39 @@ Only for the initial FFmpeg download. After that it runs fully offline.
 
 The executable isn't code-signed, and some scanners flag unsigned binaries. You can build it yourself from source, or whitelist it.
 
+
+---
+
+## Log and daily report
+
+Logs live in `%LOCALAPPDATA%\CamNexus\logs\`, one Markdown file per day, recording:
+
+- **Recording**: start, stop, failures
+- **Detection**: what was detected (class + score) and when it triggered event recording
+- **Streaming**: stalls, reconnects, recovery
+- **Settings**: what changed, item by item (e.g. "render size: 1280×720 → 960×540")
+
+The **"Today's events"** button on the main window parses today's log into a report: how much
+each channel recorded, when something moved, how long each event lasted — plus one-click access
+to the folders.
+
+
+---
+
+## Diagnostic commands
+
+When something is off, these print far more than a screenshot would:
+
+| Command | Purpose |
+|---|---|
+| `camnexus.exe --hw-test` | Print the CPU/GPU profile and the model recommendation |
+| `camnexus.exe --event-test N` | Trigger one event recording on channel N to verify the whole path |
+| `camnexus.exe --detect-test image.jpg` | Run one image through the current model; add `--gpu` for the GPU |
+| `camnexus.exe --audio-test N` | Check whether channel N has an audio track and receives samples |
+| `camnexus.exe --probe rtsp://…` | Probe whether an RTSP address works |
+| `camnexus.exe --net-test` | Print per-adapter throughput |
+| `camnexus.exe --settings` / `--fullscreen` | Open settings / start fullscreen |
+
 ---
 
 ## Configuration file
@@ -227,6 +279,26 @@ The executable isn't code-signed, and some scanners flag unsigned binaries. You 
 On first run a `config.json` is created next to the executable. All settings live there (including camera passwords — don't share it). Delete it to reset to defaults.
 
 `config.example.json` in the repository is a template you can refer to.
+
+---
+
+## Third-party components
+
+The app **does not bundle** the components below, but it does use them:
+
+| Component | Used for | Licence | How it arrives |
+|---|---|---|---|
+| FFmpeg | streaming, decoding, muxing | GPLv3 (gyan.dev build) | downloaded on first launch; `CAMNEXUS_FFMPEG_MIRROR` can point at a mirror |
+| DirectML.dll | GPU inference (ONNX Runtime's DirectML backend) | Microsoft redistributable, per the Windows SDK terms | shipped with the app |
+| Detection models (optional) | person / vehicle detection | YOLOX: Apache-2.0; YOLO26: AGPL-3.0 | downloaded by the user from inside the app |
+
+**About the detection models**: the YOLO26 family is published by [Ultralytics](https://ultralytics.com) under AGPL-3.0.
+This app does not bundle, mirror or distribute those weights; you start the download yourself, and you must first read
+the licence notice in a dialog and tick the box — without that, neither downloading nor enabling detection is possible.
+Using these models in a closed-source commercial product or service requires a commercial licence from Ultralytics.
+
+The weights carry their own licence field (`license = AGPL-3.0 License`), so you can verify it directly.
+You can delete them at any time from Settings; they live in `%LOCALAPPDATA%\CamNexus\models`.
 
 ---
 

@@ -14,6 +14,25 @@ use std::time::Instant;
 /// 最低可用版本（`-fps_mode` 自 5.1 起）
 pub const MIN_VERSION: (u32, u32) = (5, 1);
 
+/// 已校验的构建：体积与 SHA-256。
+///
+/// 下载时边下边算，落盘后比对。上游若在同一标签下重新打包，校验会失败——
+/// 这是**故意的**：宁可报错让人看见，也不要静默装上一个来源不明的可执行文件。
+/// 换版本时同步改这里（`ffmpeg -version` 里能看到构建字符串）。
+const PINNED: &[(&str, u64, &str)] = &[(
+    "b6.1.1",
+    82_797_568,
+    "04e1307997530f9cf2fe35cba2ca7e8875ca91da02f89d6c7243df819c94ad00",
+)];
+
+/// 取某个版本标签对应的体积与哈希；没有钉死的版本返回 None（不做校验）
+fn pinned(tag: &str) -> Option<(u64, &'static str)> {
+    PINNED
+        .iter()
+        .find(|(t, _, _)| *t == tag)
+        .map(|(_, size, sha)| (*size, *sha))
+}
+
 /// 候选版本：主版本挂了可以退回旧版（命令兼容性要求仅 ≥ 5.1）
 /// 已逐一验证：b6.1.1 与 b6.0 在两个源上均返回 200；5.x 的资产命名不同，暂不纳入
 const TAGS: &[&str] = &["b6.1.1", "b6.0"];
@@ -181,8 +200,10 @@ fn run(state: Shared) {
     let part = target.with_extension("part");
 
     let mut last_err = String::from(tr("没有可用的下载源"));
+    // 镜像 URL 里带版本标签（.../b6.1.1/...），取出来决定校验哪一条哈希
     for (name, url) in mirror_list() {
-        match download(&url, &part, &state, name) {
+        let tag = TAGS.iter().find(|t| url.contains(*t)).copied().unwrap_or("");
+        match download(&url, &part, &state, name, tag) {
             Ok(()) => {
                 set(&state, State::Verifying);
                 if let Err(e) = std::fs::rename(&part, &target) {
@@ -224,7 +245,13 @@ fn run(state: Shared) {
     set(&state, State::Failed(last_err));
 }
 
-fn download(url: &str, dest: &Path, state: &Shared, mirror: &'static str) -> Result<(), String> {
+fn download(
+    url: &str,
+    dest: &Path,
+    state: &Shared,
+    mirror: &'static str,
+    tag: &str,
+) -> Result<(), String> {
     let agent = ureq::Agent::config_builder()
         .timeout_global(None)
         .build()
@@ -241,6 +268,8 @@ fn download(url: &str, dest: &Path, state: &Shared, mirror: &'static str) -> Res
     let mut file = std::fs::File::create(dest).map_err(|e| i18n::err(tr("创建临时文件失败"), e))?;
 
     let mut buf = vec![0u8; 64 * 1024];
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
     let mut got: u64 = 0;
     let mut last_report = Instant::now();
     let mut last_bytes: u64 = 0;
@@ -252,6 +281,7 @@ fn download(url: &str, dest: &Path, state: &Shared, mirror: &'static str) -> Res
         }
         file.write_all(&buf[..n])
             .map_err(|e| i18n::err(tr("写入失败"), e))?;
+        hasher.update(&buf[..n]);
         got += n as u64;
 
         if last_report.elapsed().as_millis() >= 200 {
@@ -275,12 +305,44 @@ fn download(url: &str, dest: &Path, state: &Shared, mirror: &'static str) -> Res
     if got < 20 * 1024 * 1024 {
         return Err(i18n::file_too_small(got));
     }
+
+    // 体积与哈希双校验。没有钉死哈希的版本只比体积，并记录原因
+    if let Some((want_size, want_sha)) = pinned(tag) {
+        if got != want_size {
+            return Err(format!(
+                "{}（{} 字节，应为 {}）",
+                tr("下载体积不符"),
+                got,
+                want_size
+            ));
+        }
+        let got_sha = format!("{:x}", hasher.finalize());
+        if got_sha != want_sha {
+            return Err(format!(
+                "{}（{}）",
+                tr("SHA-256 不匹配，可能上游重新打包或有中间人替换"),
+                &got_sha[..16.min(got_sha.len())]
+            ));
+        }
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 钉死的哈希是「装不上」和「装错」的分界线，改错了所有人都会装不上。
+    /// 2026-11-18 实测两个源都返回同一份文件：
+    ///   82,797,568 字节 / 04e1307997530f9cf2fe35cba2ca7e8875ca91da02f89d6c7243df819c94ad00
+    #[test]
+    fn pinned_hash_covers_downloaded_build() {
+        let (size, sha) = pinned("b6.1.1").expect("b6.1.1 应当钉死哈希");
+        assert_eq!(size, 82_797_568, "体积应与实测一致");
+        assert_eq!(sha.len(), 64, "SHA-256 是 64 位十六进制");
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(pinned("b9.9.9").is_none(), "未钉死的版本不应做哈希校验");
+    }
 
     #[test]
     fn mirror_list_has_fallbacks() {
@@ -296,7 +358,9 @@ mod tests {
 
     #[test]
     fn install_path_is_under_appdata() {
-        let p = install_path().expect(tr("应能定位安装目录"));
+        let Some(p) = install_path() else {
+            panic!("{}", tr("应能定位安装目录"));
+        };
         assert!(p.to_string_lossy().to_lowercase().contains("camnexus"));
         assert!(p.to_string_lossy().ends_with("ffmpeg.exe") || !cfg!(windows));
     }

@@ -51,6 +51,11 @@ pub struct Pal {
     pub text: egui::Color32,
     pub muted: egui::Color32,
     pub warn_bg: egui::Color32,
+    /// 底部浮层提示的底色与文字色。
+    /// 单独给一组，是因为它浮在画面之上、和主题底色无关：
+    /// 之前底色写死深色、文字却跟着主题走，浅色主题下深字配深底，等于看不见。
+    pub toast_bg: egui::Color32,
+    pub toast_text: egui::Color32,
     pub window: egui::Color32,
     /// 卡片里的次级面（输入框、分组底）
     pub surface: egui::Color32,
@@ -67,6 +72,8 @@ pub const PAL_DARK: Pal = Pal {
     text: egui::Color32::from_rgb(231, 235, 242),
     muted: egui::Color32::from_rgb(134, 143, 158),
     warn_bg: egui::Color32::from_rgb(58, 47, 20),
+    toast_bg: egui::Color32::from_rgb(30, 36, 46),
+    toast_text: egui::Color32::from_rgb(236, 240, 246),
     window: egui::Color32::from_rgb(20, 24, 31),
     surface: egui::Color32::from_rgb(25, 29, 37),
     stroke: egui::Color32::from_rgb(38, 44, 55),
@@ -80,6 +87,10 @@ pub const PAL_LIGHT: Pal = Pal {
     text: egui::Color32::from_rgb(26, 31, 39),
     muted: egui::Color32::from_rgb(105, 113, 127),
     warn_bg: egui::Color32::from_rgb(255, 246, 216),
+    // 浅色主题下仍用深色浮层（Material 那种 snackbar 观感），
+    // 因为它浮在监控画面上，浅底反而会糊掉
+    toast_bg: egui::Color32::from_rgb(42, 48, 60),
+    toast_text: egui::Color32::from_rgb(245, 248, 252),
     window: egui::Color32::from_rgb(255, 255, 255),
     surface: egui::Color32::from_rgb(247, 249, 252),
     stroke: egui::Color32::from_rgb(217, 223, 232),
@@ -125,6 +136,48 @@ enum TileAct {
     AutoLayout,
     Snapshot,
     Reconnect,
+}
+
+/// 勾选同意后要继续的动作
+#[derive(Clone, Copy, PartialEq)]
+enum NoticeAction {
+    /// 让程序下载
+    Download,
+    /// 打开浏览器，由用户手动下载
+    OpenBrowser,
+}
+
+/// 同意许可之后该干什么
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AfterAgree {
+    /// 文件已在本机：只记录同意、直接可用，不再下载
+    EnableOnly,
+    /// 让程序下载
+    Download,
+    /// 打开浏览器，由用户手动下载
+    OpenBrowser,
+}
+
+/// 这是「同意之后做什么」的唯一判定点。
+///
+/// 单独抽出来的原因：模型可能已经在 `models/` 里（手动放进去的、或者上一次
+/// 下过但许可没同意），这时再点一次「同意」不应该覆盖已有文件，更不该重新
+/// 下载一遍几百 MB。
+fn after_agree(installed: bool, action: NoticeAction) -> AfterAgree {
+    if installed {
+        return AfterAgree::EnableOnly;
+    }
+    match action {
+        NoticeAction::Download => AfterAgree::Download,
+        NoticeAction::OpenBrowser => AfterAgree::OpenBrowser,
+    }
+}
+
+/// 许可须知弹窗的状态
+struct NoticeUi {
+    id: &'static str,
+    agreed: bool,
+    action: NoticeAction,
 }
 
 pub struct CamNexusApp {
@@ -189,7 +242,26 @@ pub struct CamNexusApp {
     /// 目标检测
     detect: Option<DetectRuntime>,
     /// 实验功能：模型是否已就位（缓存，避免每帧 stat 文件）
-    model_ready: bool,
+    /// 事件录像：每路一个 tap（与通道索引对齐，禁用通道为 None）
+    event_taps: Vec<Option<crate::eventrec::Tap>>,
+    /// 回放窗口当前看的是全天录像还是事件片段
+    replay_events: bool,
+    /// 每路上一帧是否处于「有目标」状态，用于只记一次触发日志
+    /// 每路「当前这次事件」的日志保持截止时间。
+    ///
+    /// 早先用 `Vec<bool>` 记录上一帧是否命中，但检测会漏帧：人还在画面里，
+    /// 某一帧恰好没检出，布尔值就跌回 false，下一帧又命中，于是同一个事件
+    /// 两秒内写了 5 条日志。改成按时间窗口保持，和 tap 的触发窗口对齐。
+    event_hot_until: Vec<Option<Instant>>,
+    /// 今日报告窗口
+    show_events_report: bool,
+    /// 启动时的识别恢复只做一次
+    detect_init: bool,
+    report_cache: Option<ReportCache>,
+    /// 许可须知弹窗（None = 没弹出）
+    notice: Option<NoticeUi>,
+    /// 正在下载哪个模型（切换模型时用来区分进度归属）
+    downloading_model: Option<String>,
     /// 模型下载进度
     model_state: crate::model::Shared,
     /// 是否处于（无边框）全屏
@@ -198,6 +270,9 @@ pub struct CamNexusApp {
     tiles_dirty: bool,
     /// 命令行 --snapshot 触发的一次性抓拍（等首帧到达再执行）
     pending_snapshot: Option<(usize, Instant)>,
+    /// 待执行的全屏切换。窗口最大化时必须先恢复，否则进全屏后
+    /// 底部会留一条任务栏高度的黑边；恢复和全屏要分帧下发才生效。
+    pending_fullscreen: Option<(bool, u8)>,
     /// 每路的裁剪黑边检测状态
     crops: std::collections::HashMap<usize, CropWatch>,
     /// 全屏下顶栏是否降下来了（鼠标靠近顶部才出）
@@ -511,14 +586,18 @@ impl CamNexusApp {
         }
         let p = self.pal();
         let mut open = true;
-        let root = crate::record::record_root(&self.cfg);
+        let all_root = crate::record::record_root(&self.cfg);
+        let ev_root = crate::record::events_root(&self.cfg);
+        let root = if self.replay_events { &ev_root } else { &all_root };
         let mut pick_channel: Option<usize> = None;
+        let mut open_all = false;
+        let mut open_ev = false;
 
         // 每帧扫目录太浪费：打开窗口时算一次并缓存
         if self.replay_days.is_none() {
             self.replay_days = Some(
                 (0..self.cfg.channels.len())
-                    .map(|i| crate::record::dates_for(&root, &self.cfg.channels, i))
+                    .map(|i| crate::record::dates_for(root, &self.cfg.channels, i))
                     .collect(),
             );
         }
@@ -534,9 +613,43 @@ impl CamNexusApp {
             .default_height(380.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO);
 
-        win.show(ctx, |ui| match self.replay_channel {
+        win.show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let mut want_ev = self.replay_events;
+                if ui
+                    .selectable_label(!want_ev, tr("全天录像"))
+                    .on_hover_text(tr("整点分段的连续录制文件"))
+                    .clicked()
+                {
+                    want_ev = false;
+                }
+                if ui
+                    .selectable_label(want_ev, tr("事件片段"))
+                    .on_hover_text(tr("识别到人/车才存下来的短片"))
+                    .clicked()
+                {
+                    want_ev = true;
+                }
+                if want_ev != self.replay_events {
+                    self.replay_events = want_ev;
+                    self.replay_channel = None;
+                    self.replay_days = None;
+                    ctx.request_repaint();
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button(tr("事件目录")).clicked() {
+                        open_ev = true;
+                    }
+                    if ui.button(tr("全天目录")).clicked() {
+                        open_all = true;
+                    }
+                });
+            });
+            ui.add_space(6.0);
+
+            match self.replay_channel {
             None => {
-                ui.label(egui::RichText::new(tr("选择通道")).strong());
+                ui.label(egui::RichText::new(tr("选择通道")).strong().color(p.text));
                 ui.add_space(4.0);
                 ui.label(
                     egui::RichText::new(tr("录像按「日期 / 通道」存放，点开通道后选择日期即可查看"))
@@ -579,7 +692,7 @@ impl CamNexusApp {
                     if ui.button(tr("← 返回")).clicked() {
                         self.replay_channel = None;
                     }
-                    ui.label(egui::RichText::new(&name).strong());
+                    ui.label(egui::RichText::new(&name).strong().color(p.text));
                 });
                 ui.add_space(8.0);
                 if days.is_empty() {
@@ -608,7 +721,16 @@ impl CamNexusApp {
                         });
                 }
             }
+            }
         });
+
+        if open_all {
+            let _ = crate::record::open_folder(&all_root);
+        }
+        if open_ev {
+            let _ = std::fs::create_dir_all(&ev_root);
+            let _ = crate::record::open_folder(&ev_root);
+        }
 
         if let Some(i) = pick_channel {
             self.replay_channel = Some(i);
@@ -696,7 +818,11 @@ impl CamNexusApp {
             .default_width(440.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .show(ctx, |ui| {
-                ui.label(egui::RichText::new(tr("CamNexus · 监控中枢")).size(17.0).strong());
+                ui.label(
+                    egui::RichText::new(tr("CamNexus · 监控中枢"))
+                        .size(17.0)
+                        .color(p.text),
+                );
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(i18n::version(env!("CARGO_PKG_VERSION")))
@@ -736,6 +862,73 @@ impl CamNexusApp {
                         );
                         row(tr("日志目录"), log_dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default());
                     });
+                // ---------- 第三方组件许可 ----------
+                // 不是为了好看：FFmpeg 是 GPLv3、YOLO26 是 AGPL-3.0，
+                // 两者都只在用户机器上按需获取、不随包分发，写明归属最省事。
+                ui.add_space(12.0);
+                section_title(ui, &p, tr("第三方组件"));
+                ui.add_space(2.0);
+
+                let model = crate::model::MODELS
+                    .iter()
+                    .find(|m| m.name.eq_ignore_ascii_case(&self.cfg.detect.model))
+                    .or_else(|| crate::model::MODELS.first());
+
+                egui::Grid::new("about_lic")
+                    .num_columns(2)
+                    .spacing([16.0, 5.0])
+                    .show(ui, |ui| {
+                        let mut row = |k: String, v: &str| {
+                            ui.label(egui::RichText::new(k).size(11.5).color(p.text));
+                            ui.label(egui::RichText::new(v).size(11.5).color(p.muted));
+                            ui.end_row();
+                        };
+                        row(tr("CamNexus 本体").to_string(), "MIT");
+                        row("egui / eframe".to_string(), "MIT / Apache-2.0");
+                        row("ONNX Runtime".to_string(), "MIT");
+                        row(
+                            if self.ffmpeg_ver.is_empty() {
+                                "FFmpeg".to_string()
+                            } else {
+                                // 版本串像 6.1.1-essentials_build-www.gyan.dev，
+                                // 许可列已经写了构建来源，这里只留主版本
+                                let short = self
+                                    .ffmpeg_ver
+                                    .split('-')
+                                    .next()
+                                    .unwrap_or(&self.ffmpeg_ver);
+                                format!("FFmpeg {short}")
+                            },
+                            "GPLv3（gyan.dev 构建）",
+                        );
+                        if let Some(m) = model {
+                            row(
+                                format!("{}（{}）", tr("识别模型"), m.name),
+                                m.license.label(),
+                            );
+                        }
+                    });
+
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(tr(
+                        "FFmpeg 与识别模型都在本机按需下载，不随程序分发；FFmpeg 以独立进程调用，不做链接。",
+                    ))
+                    .size(10.5)
+                    .color(p.muted),
+                );
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.hyperlink_to(
+                        egui::RichText::new(tr("FFmpeg 许可")).size(10.5),
+                        "https://ffmpeg.org/legal.html",
+                    );
+                    ui.hyperlink_to(
+                        egui::RichText::new("AGPL-3.0").size(10.5),
+                        "https://www.gnu.org/licenses/agpl-3.0.html",
+                    );
+                });
+
                 ui.add_space(12.0);
                 ui.horizontal(|ui| {
                     if ui.button(tr("打开存档目录")).clicked() {
@@ -836,6 +1029,11 @@ impl CamNexusApp {
         let welcome_prompt =
             cfg.onboarding == config::Onboarding::NotAsked && cfg.channels.is_empty();
         logs::prune(30);
+        // 上次被强杀可能留下 .part.ts：能重封装就重封装，别直接丢素材。
+        // 只扫一次——事件目录在录像根目录**里面**，扫两遍会把同一个文件
+        // 排进两个重封装任务，后一个任务找不到源文件就把前一个的成品删掉。
+        crate::eventrec::recover_parts(&crate::record::record_root(&cfg));
+
         let mut app = Self {
             draft: cfg.clone(),
             volume: Arc::new(AtomicU32::new(cfg.volume.to_bits())),
@@ -880,11 +1078,19 @@ impl CamNexusApp {
             ffmpeg_ver,
             replay_days: None,
             detect: None,
-            model_ready: crate::model::installed().is_some(),
+            event_taps: Vec::new(),
+            replay_events: false,
+            event_hot_until: Vec::new(),
+            show_events_report: false,
+            detect_init: false,
+            report_cache: None,
+            notice: None,
+            downloading_model: None,
             model_state: crate::model::shared(),
             fullscreen: false,
             tiles_dirty: false,
             pending_snapshot: None,
+            pending_fullscreen: None,
             crops: std::collections::HashMap::new(),
             bar_revealed: false,
             records: RecordManager::new(),
@@ -973,7 +1179,7 @@ impl CamNexusApp {
     /// 启动即开启识别（--detect）
     pub fn enable_detect(&mut self, ctx: &egui::Context) {
         if self.detect.is_none() {
-            self.detect = Some(DetectRuntime::spawn(ctx.clone(), self.cfg.detect));
+            self.detect = Some(DetectRuntime::spawn(ctx.clone(), self.cfg.detect.clone()));
         }
     }
 
@@ -1116,6 +1322,8 @@ impl CamNexusApp {
         // 这里要**等**它退出：旧的录像会话还占着相机额度，
         // 如果立刻起新流，同一台相机上会瞬间超限，表现为新流随机几路连不上。
         self.records.shutdown_within(Duration::from_millis(900));
+        // tap 也占着相机会话，必须一起停，否则重建时新旧连接会打架
+        self.event_taps.clear();
         self.active_sig = stream_sig(&self.cfg);
         self.streams.clear();
         self.textures.clear();
@@ -1141,9 +1349,11 @@ impl CamNexusApp {
             fresh.push(self.spawn_one_delayed(i, delay));
         }
         self.streams = fresh;
+        self.start_event_taps();
 
-        // 自动录像：只有开了这个开关才动录制状态；实际开录还要等画面在线
-        if self.cfg.auto_record {
+        // 自动录像：只在连续模式生效。事件模式下录像由 tap 负责，
+        // 这里再开一路会把相机会话翻倍。
+        if self.cfg.auto_record && self.cfg.record_mode == crate::config::RecordMode::Continuous {
             let idxs: Vec<usize> = self
                 .cfg
                 .channels
@@ -1463,7 +1673,11 @@ impl CamNexusApp {
         }
 
         let mut next = bar;
-        egui::Popup::menu(&resp).show(|ui| {
+        // 勾选后不关闭：数据栏这几项常常要连勾几个，
+        // 每勾一次就关掉、要重新点开，很难用。
+        egui::Popup::menu(&resp)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
             ui.set_min_width(168.0);
             // 菜单行距比常规控件紧一点，读完一行不用跳很远
             ui.spacing_mut().item_spacing.y = 4.0;
@@ -1493,6 +1707,7 @@ impl CamNexusApp {
         let mut kick_all = false;
         let mut reconnect_now = false;
         let mut open_replay = false;
+        let mut open_events = false;
         let mut open_logs = false;
         let mut open_about = false;
         let mut toggle_detect = false;
@@ -1559,7 +1774,7 @@ impl CamNexusApp {
                     open_logs = true;
                 }
                 // 识别是实验功能：只有用户在设置里启用、且模型已下载，主界面才出现这个按钮
-                if self.cfg.detect.enabled && self.model_ready {
+                if self.cfg.detect.enabled && self.model_ready_now() {
                     let detect_on = self.detect.as_ref().map(|d| d.enabled).unwrap_or(false);
                     let label = if detect_on {
                         egui::RichText::new(tr("识别 · 开")).color(OK)
@@ -1570,17 +1785,20 @@ impl CamNexusApp {
                         crate::config::DetectDevice::Cpu => "CPU",
                         crate::config::DetectDevice::Gpu => tr("显卡"),
                     };
-                    let tip = i18n::detect_tip(
-                        self.cfg.detect.effective_fps(),
-                        dev,
-                        &i18n::static_grace(self.cfg.detect.static_grace_secs),
-                    );
+                    let tip = i18n::detect_tip(self.cfg.detect.effective_fps(), dev);
                     if ui.button(label).on_hover_text(tip).clicked() {
                         toggle_detect = true;
                     }
                 }
                 if ui.button(tr("回放")).clicked() {
                     open_replay = true;
+                }
+                if ui
+                    .button(tr("今日事件"))
+                    .on_hover_text(tr("看今天录了多久、哪些时段有人或车经过"))
+                    .clicked()
+                {
+                    open_events = true;
                 }
             },
         );
@@ -1592,9 +1810,10 @@ impl CamNexusApp {
         }
 
         if toggle_detect {
+            let mut refresh_taps = false;
             match self.detect.as_mut() {
                 None => {
-                    let rt = DetectRuntime::spawn(ui.ctx().clone(), self.cfg.detect);
+                    let rt = DetectRuntime::spawn(ui.ctx().clone(), self.cfg.detect.clone());
                     let status = rt.status.clone();
                     self.detect = Some(rt);
                     if !status.is_empty() && !status.contains(tr("加载")) {
@@ -1606,13 +1825,33 @@ impl CamNexusApp {
                     if !d.enabled {
                         d.results.clear();
                     }
+                    // 落盘：崩溃后被守护进程拉起时才不会再变回关闭
+                    self.cfg.detect.running = d.enabled;
+                    let _ = self.cfg.save();
+                    refresh_taps = true;
+                    logs::append(
+                        "识别",
+                        if d.enabled {
+                            tr("已在主界面开启识别")
+                        } else {
+                            tr("已在主界面关闭识别")
+                        },
+                    );
                 }
+            }
+            // 事件录像完全依赖识别：开关一变就要重建 tap，
+            // 否则关掉识别后 tap 会一直占着相机会话却永远不触发
+            if refresh_taps {
+                self.start_event_taps();
             }
         }
         if open_replay {
             self.replay_channel = None;
             self.replay_days = None;
             self.show_replay = true;
+        }
+        if open_events {
+            self.show_events_report = true;
         }
         if open_logs {
             self.show_logs = true;
@@ -2095,6 +2334,7 @@ impl CamNexusApp {
         Some(Stream::spawn(StreamCfg {
             // 监看/识别用子码流（若已配置），录制在 record.rs 里仍走主码流
             url: c.display_rtsp(),
+            name: c.name.clone(),
             ffmpeg,
             width: self.cfg.render_width,
             height: self.cfg.render_height,
@@ -2113,6 +2353,30 @@ impl CamNexusApp {
         if on && self.solo.is_some() {
             self.solo = None;
         }
+        // 最大化状态下直接进全屏，Windows 会保留「最大化」那一套尺寸
+        // （屏幕高度减去任务栏），表现为最底下一条黑边。
+        // 必须先把窗口恢复成普通状态，隔一帧再进全屏。
+        let maximized = ctx.input(|i| i.viewport().maximized).unwrap_or(false);
+        if on && maximized {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+            self.pending_fullscreen = Some((true, 1));
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!on));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+    }
+
+    /// 每帧开头调用：把「先恢复、再全屏」这个两步动作走完
+    fn poll_pending_fullscreen(&mut self, ctx: &egui::Context) {
+        let Some((on, left)) = self.pending_fullscreen else {
+            return;
+        };
+        if left > 0 {
+            self.pending_fullscreen = Some((on, left - 1));
+            ctx.request_repaint();
+            return;
+        }
+        self.pending_fullscreen = None;
         ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!on));
         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
     }
@@ -2424,7 +2688,16 @@ impl CamNexusApp {
         }
 
         // 录制开关：喇叭左边。白=未录，红=录制中
-        let rec_on = self.records.is_recording(idx);
+        let ev_mode = self.cfg.record_mode == crate::config::RecordMode::Event;
+        let rec_on = if ev_mode {
+            self.event_taps
+                .get(idx)
+                .and_then(|t| t.as_ref())
+                .map(|t| t.is_recording())
+                .unwrap_or(false)
+        } else {
+            self.records.is_recording(idx)
+        };
         let rec_size = 22.0;
         // 被全屏按钮压住时整排左移；此时纵向也对齐到按钮中心
         let shift = self.fs_row_shift(rect);
@@ -2446,20 +2719,8 @@ impl CamNexusApp {
             egui::vec2(size, size),
         );
 
-        // 控制组底板：亮画面上纯白图标会糊掉，垫一层半透明底。
-        // 格子太小时不画，否则底板会占掉大半个画面
-        if rect.width() > 120.0 {
-            let p = ui.painter_at(rect);
-            let group = egui::Rect::from_min_max(
-                rec_rect.min - egui::vec2(6.0, 5.0),
-                icon_rect.max + egui::vec2(6.0, 5.0),
-            );
-            p.rect_filled(
-                group,
-                egui::CornerRadius::same(9),
-                egui::Color32::from_black_alpha(105),
-            );
-        }
+        // 不再垫圆角底板：底板在深色画面上像一块补丁。
+        // 可读性靠图标自带的投影（下面绘制的 +1px 黑色偏移）。
 
         let resp_rec = ui.interact(
             rec_rect.expand(7.0),
@@ -2468,24 +2729,25 @@ impl CamNexusApp {
         );
         {
             let p = ui.painter_at(rect);
-            if resp_rec.hovered() {
-                p.circle_filled(
-                    rec_rect.center(),
-                    rec_size * 0.85,
-                    egui::Color32::from_black_alpha(90),
-                );
-            }
+            // 悬停时图标向外扩 1px（整体大 2px），比加圆圈更干净
+            let draw = if resp_rec.hovered() {
+                rec_rect.expand(1.0)
+            } else {
+                rec_rect
+            };
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             p.image(
                 self.icons.record.id(),
-                rec_rect.translate(egui::vec2(1.0, 1.0)),
+                draw.translate(egui::vec2(1.0, 1.0)),
                 uv,
-                egui::Color32::from_black_alpha(150),
+                egui::Color32::from_black_alpha(160),
             );
             let tint = if rec_on { ERR } else { egui::Color32::WHITE };
-            p.image(self.icons.record.id(), rec_rect, uv, tint);
+            p.image(self.icons.record.id(), draw, uv, tint);
         }
-        if resp_rec.clicked() {
+        if resp_rec.clicked() && ev_mode {
+            self.toast(tr("事件录制模式下由识别自动开关，不需要手动点"));
+        } else if resp_rec.clicked() {
             let was_on = self.records.is_recording(idx);
             // 不在线时不允许开始：录出来只会是空文件，还会白烧重试次数
             let online = self.online_mask.get(idx).copied().unwrap_or(false);
@@ -2512,13 +2774,6 @@ impl CamNexusApp {
         );
         {
             let p = ui.painter_at(rect);
-            if resp_btn.hovered() {
-                p.circle_filled(
-                    icon_rect.center(),
-                    size * 0.85,
-                    egui::Color32::from_black_alpha(90),
-                );
-            }
             let tex = if audible {
                 self.icons.on.id()
             } else {
@@ -2527,7 +2782,12 @@ impl CamNexusApp {
             let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
             // 喇叭图标视觉上偏上，下沉 1px 与录像图标对齐；
             // 只动绘制位置，命中区仍是 icon_rect
-            let draw = icon_rect.translate(egui::vec2(0.0, 1.0));
+            let base = if resp_btn.hovered() {
+                icon_rect.expand(1.0)
+            } else {
+                icon_rect
+            };
+            let draw = base.translate(egui::vec2(0.0, 1.0));
             // 阴影提升亮场景下的可读性
             p.image(
                 tex,
@@ -2768,11 +3028,11 @@ impl CamNexusApp {
         let shown = win.show(ctx, |ui| {
                 egui::Panel::bottom("set_actions")
                     .frame(
+                        // 不画边框：Frame 的 stroke 是**整圈**矩形，
+                        // 看起来就是四个按钮外面套了个细方框
                         egui::Frame::NONE
                             .inner_margin(egui::Margin::symmetric(0, 10))
-                            .fill(ui.visuals().window_fill)
-                            // 上边一条发丝线，把操作区和表单分开
-                            .stroke(egui::Stroke::new(1.0, p.stroke)),
+                            .fill(ui.visuals().window_fill),
                     )
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
@@ -2858,6 +3118,11 @@ impl CamNexusApp {
                         // 否则窗口宽度会随标签页内容跳来跳去
                         egui::ScrollArea::vertical()
                             .auto_shrink([false, false])
+                            // 常显滚动条：这一栏内容常常超出可视高度，
+                            // 不显示的话看起来就是「内容被裁掉了」
+                            .scroll_bar_visibility(
+                                egui::scroll_area::ScrollBarVisibility::AlwaysVisible,
+                            )
                             .show(ui, |ui| {
                             match self.settings_tab {
                                 SetTab::Channels => self.set_tab_channels(ui),
@@ -2878,15 +3143,33 @@ impl CamNexusApp {
         if save || save_reconnect {
             let need_reconnect = stream_sig(&self.draft) != stream_sig(&self.cfg);
             let detect_changed = self.draft.detect != self.cfg.detect;
+            let event_changed = self.draft.record_mode != self.cfg.record_mode
+                || self.draft.event_pre_secs != self.cfg.event_pre_secs
+                || self.draft.event_post_secs != self.cfg.event_post_secs
+                || self.draft.event_merge_gap_secs != self.cfg.event_merge_gap_secs
+                || self.draft.event_max_clip_secs != self.cfg.event_max_clip_secs;
+            // 事件录制没有识别就是空转：保存时直接退回连续录制，别让用户以为在录
+            let fallback_event = self.draft.record_mode == crate::config::RecordMode::Event
+                && !self.detection_ready_with(&self.draft);
+            if fallback_event {
+                self.draft.record_mode = crate::config::RecordMode::Continuous;
+            }
+            let old_cfg = self.cfg.clone();
             self.cfg = self.draft.clone();
             if detect_changed {
                 // 设备/频率/夜视/豁免变了：重建推理线程（显卡首次加载约 0.9 秒）
                 let prev = self.detect.take();
                 let was_on = prev.as_ref().map(|d| d.enabled).unwrap_or(false);
                 drop(prev); // 丢掉 tx 后旧线程会在 recv 处退出
-                // 关掉实验开关、或模型被删了，就不再拉起推理线程
-                if was_on && self.cfg.detect.enabled && self.model_ready {
-                    self.detect = Some(DetectRuntime::spawn(ctx.clone(), self.cfg.detect));
+                // 三个条件都满足才拉起：功能开着、上次是开着的、模型可用
+                let should_run = self.cfg.detect.enabled
+                    && self.cfg.detect.running
+                    && self.model_ready_now();
+                if should_run {
+                    self.detect = Some(DetectRuntime::spawn(ctx.clone(), self.cfg.detect.clone()));
+                } else if was_on && self.cfg.detect.enabled {
+                    // 功能还在、这次不该跑：记下来，下次别自作主张
+                    self.cfg.detect.running = false;
                 }
             }
             self.volume
@@ -2896,9 +3179,20 @@ impl CamNexusApp {
             }
             apply_style(ctx, self.cfg.dark);
             let saved = self.cfg.save();
+            log_settings_change(&old_cfg, &self.cfg);
             // 自启项跟着设置走：改了就在这里落注册表
             let auto_err = self.sync_autostart();
             self.show_settings = false;
+            if fallback_event {
+                self.toast(tr("识别不可用，已切回 7×24 连续录制"));
+            }
+            // 录像方式或缓冲参数变了，tap 要跟着重建；
+            // 不跟着 stream 走，否则改个参数还得重连相机
+            // 保存并重连时 rebuild_streams 里会重建，这里别重复建：
+            // 两次建 tap 会在相机上瞬间多占一轮会话
+            if (event_changed || detect_changed) && !save_reconnect {
+                self.start_event_taps();
+            }
 
             if save_reconnect {
                 self.rebuild_streams();
@@ -3042,7 +3336,118 @@ impl CamNexusApp {
         let p = self.pal();
         let root = crate::record::record_root(&self.draft);
 
-        ui.label(egui::RichText::new(tr("存档目录")).strong());
+        section_title(ui, &p, tr("录像方式"));
+        ui.add_space(4.0);
+        let ev = self.draft.record_mode == crate::config::RecordMode::Event;
+        if ui
+            .radio(!ev, tr("7×24 连续录制"))
+            .on_hover_text(tr("一直在录，超出容量上限后删最旧的。占空间，但不会漏任何画面"))
+            .clicked()
+        {
+            self.draft.record_mode = crate::config::RecordMode::Continuous;
+        }
+        // 事件录制依赖识别：模型没下载、实验开关没打开时不允许选
+        let can_event = self.detection_ready_with(&self.draft);
+        let ev_resp = ui
+            .add_enabled_ui(can_event, |ui| {
+                ui.radio(ev, tr("事件录制（识别到人/车才存盘）"))
+                    .on_hover_text(tr(
+                        "常连相机但不写盘：画面只在内存里留几秒，识别到目标才把前后几秒存成片段。\n省硬盘、护盘，依赖智能识别",
+                    ))
+                    .clicked()
+            })
+            .inner;
+        if ev_resp {
+            self.draft.record_mode = crate::config::RecordMode::Event;
+        }
+        if !can_event {
+            let why = if !self.draft.detect.enabled {
+                tr("事件录制依赖智能识别：请先到「实验」页启用识别")
+            } else {
+                tr("事件录制依赖智能识别：请先到「实验」页下载模型并同意许可")
+            };
+            ui.label(egui::RichText::new(why).size(11.0).color(WARN));
+            // 已经存成事件模式但识别不可用：明确告诉用户现在什么都不录
+            if ev {
+                ui.label(
+                    egui::RichText::new(tr("当前配置是事件录制，但识别不可用，因此不会录制任何画面"))
+                        .size(11.0)
+                        .color(ERR),
+                );
+            }
+        }
+
+        if ev {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(tr("触发后继续录"));
+                let mut post = self.draft.event_post_secs.clamp(1, 60);
+                if ui
+                    .add(egui::DragValue::new(&mut post).range(1..=60).suffix(" 秒"))
+                    .changed()
+                {
+                    self.draft.event_post_secs = post;
+                }
+                ui.add_space(8.0);
+                ui.label(tr("内存缓冲"));
+                let mut pre = self.draft.event_pre_secs.clamp(2, 30);
+                if ui
+                    .add(egui::DragValue::new(&mut pre).range(2..=30).suffix(" 秒"))
+                    .changed()
+                {
+                    self.draft.event_pre_secs = pre;
+                }
+            });
+            ui.label(
+                egui::RichText::new(tr(
+                    "缓冲这几秒只占内存（每路约数 MB），不写盘；实际片段起点会对齐到关键帧，可能多几秒",
+                ))
+                .size(10.5)
+                .color(p.muted),
+            );
+
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label(tr("相邻片段合并"));
+                let mut gap = self.draft.event_merge_gap_secs.min(300);
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut gap)
+                            .range(0..=300)
+                            .suffix(" 秒"),
+                    )
+                    .changed()
+                {
+                    self.draft.event_merge_gap_secs = gap;
+                }
+                help(
+                    ui,
+                    tr("同一路两段间隔小于这个值时拼成一个文件，避免遮挡、走走停停切出一堆碎片；0 = 不合并"),
+                );
+            });
+
+            ui.horizontal(|ui| {
+                ui.label(tr("单段最长"));
+                let mut maxc = self.draft.event_max_clip_secs.min(7200);
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut maxc)
+                            .range(0..=7200)
+                            .suffix(" 秒"),
+                    )
+                    .changed()
+                {
+                    self.draft.event_max_clip_secs = maxc;
+                }
+                help(
+                    ui,
+                    tr("到点强行收尾，等目标离开画面才恢复录制；防止一辆一直停着的车把事件录像变成 24 小时录制。0 = 不限"),
+                );
+            });
+        }
+
+        ui.add_space(12.0);
+        section_title(ui, &p, tr("存档目录"));
         ui.add_space(4.0);
         // 输入框单独占一行：把 desired_width(INFINITY) 塞进 horizontal 会让窗口被撑到全屏宽
         ui.add(
@@ -3064,7 +3469,7 @@ impl CamNexusApp {
         });
 
         ui.add_space(12.0);
-        ui.label(egui::RichText::new(tr("占用上限")).strong());
+        section_title(ui, &p, tr("占用上限"));
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             // 界面上按 GB 调，配置里仍存 MB
@@ -3116,11 +3521,9 @@ impl CamNexusApp {
             );
         }
 
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(8.0);
+        ui.add_space(5.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(tr("每通道录制参数")).strong());
+            section_title(ui, &p, tr("每通道录制参数"));
             help(
                 ui,
                 tr("默认跟随送显分辨率；画质越高越清晰、占空间也越大"),
@@ -3134,7 +3537,7 @@ impl CamNexusApp {
                     .fill(p.card)
                     .inner_margin(egui::Margin::same(10))
                     .show(ui, |ui| {
-                        ui.label(egui::RichText::new(ch.name.clone()).size(12.0).strong());
+                        ui.label(egui::RichText::new(ch.name.clone()).size(12.0).strong().color(p.text));
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             // 分辨率：源画质排第一，它是默认项，也是最省 CPU 的
@@ -3265,14 +3668,518 @@ impl CamNexusApp {
         }
     }
 
+
+    /// 今日报告：全天录了多久 + 事件片段清单（从日志解析）
+    fn events_report_window(&mut self, ctx: &egui::Context) {
+        if !self.show_events_report {
+            return;
+        }
+        let p = self.pal();
+        let mut open = true;
+        let day = logs::today();
+        let ev_root = crate::record::events_root(&self.cfg);
+        let all_root = crate::record::record_root(&self.cfg);
+
+        // 每 2 秒重建一次缓存：日志是追加写的，2 秒足够新
+        let stale = match &self.report_cache {
+            Some(c) => c.day != day || c.at.elapsed().as_secs() >= 2,
+            None => true,
+        };
+        if stale {
+            let text = logs::file_for(&day)
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .unwrap_or_default();
+            let totals = (0..self.cfg.channels.len())
+                .map(|i| crate::record::day_totals(&all_root, &self.cfg.channels, i, &day))
+                .collect();
+            self.report_cache = Some(ReportCache {
+                at: std::time::Instant::now(),
+                day: day.clone(),
+                spans: parse_event_spans(&text),
+                totals,
+            });
+        }
+        // 上面刚按需重建过，拿不到就说明逻辑写错了；用 let-else 而不是 expect，
+        // 万一将来改了顺序也只是少显示一屏，不会把界面搞崩
+        let Some(cache) = self.report_cache.as_ref() else {
+            return;
+        };
+        let spans = &cache.spans;
+        let totals = &cache.totals;
+        let mut open_ev = false;
+        let mut open_all = false;
+
+        egui::Window::new(tr("今日报告"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .default_height(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(&day).strong().color(p.text));
+                ui.add_space(6.0);
+
+                // 全天录制量
+                let mut total_secs = 0u64;
+                egui::Frame::NONE
+                    .fill(p.card)
+                    .inner_margin(egui::Margin::same(10))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(tr("全天录像")).strong().color(p.text));
+                        ui.add_space(4.0);
+                        for (i, ch) in self.cfg.channels.iter().enumerate() {
+                            let (files, secs) = totals.get(i).copied().unwrap_or((0, 0));
+                            total_secs += secs;
+                            let txt = if files == 0 {
+                                tr("今天没有录像").to_string()
+                            } else {
+                                format!("{files} 个文件 · {}", fmt_dur(secs as u32))
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(&ch.name);
+                                ui.label(
+                                    egui::RichText::new(txt)
+                                        .size(11.5)
+                                        .color(if files == 0 { p.muted } else { OK }),
+                                );
+                            });
+                        }
+                        if total_secs > 0 {
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} {}",
+                                    tr("合计"),
+                                    fmt_dur(total_secs.min(u32::MAX as u64) as u32)
+                                ))
+                                .size(11.0)
+                                .color(p.muted),
+                            );
+                        }
+                    });
+
+                ui.add_space(10.0);
+
+                // 事件片段
+                let done: Vec<&EvSpan> = spans.iter().filter(|s| s.end.is_some()).collect();
+                let live: Vec<&EvSpan> = spans
+                    .iter()
+                    .filter(|s| s.end.is_none() && !s.aborted)
+                    .collect();
+                // 日志里记的是「开始写文件 → 收尾」，片段实际还含触发前的前摇
+                let pre = self.cfg.event_pre_secs;
+                let ev_secs: u32 = done
+                    .iter()
+                    .filter_map(|s| {
+                        if let Some(v) = s.secs {
+                            return Some(v);
+                        }
+                        let a = hms_secs(&s.start)?;
+                        let b = hms_secs(s.end.as_deref()?)?;
+                        Some(b.saturating_sub(a) + pre)
+                    })
+                    .sum();
+
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} {} · {}",
+                        tr("今日事件"),
+                        i18n::event_count(done.len() as u32),
+                        fmt_dur(ev_secs)
+                    ))
+                    .strong(),
+                );
+                ui.add_space(4.0);
+
+                if spans.is_empty() {
+                    ui.label(
+                        egui::RichText::new(tr("今天还没有检测到人/车"))
+                            .size(11.5)
+                            .color(p.muted),
+                    );
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(220.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("ev_grid")
+                                .num_columns(4)
+                                .spacing([16.0, 4.0])
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new(tr("通道")).size(11.0).color(p.muted));
+                                    ui.label(egui::RichText::new(tr("开始")).size(11.0).color(p.muted));
+                                    ui.label(egui::RichText::new(tr("结束")).size(11.0).color(p.muted));
+                                    ui.label(egui::RichText::new(tr("时长")).size(11.0).color(p.muted));
+                                    ui.end_row();
+                                    for s in spans.iter() {
+                                        ui.label(&s.channel);
+                                        ui.label(&s.start);
+                                        match &s.end {
+                                            Some(e) => {
+                                                ui.label(e);
+                                                let d = s.secs.or_else(|| {
+                                                    hms_secs(e).zip(hms_secs(&s.start)).map(
+                                                        |(b, a)| b.saturating_sub(a) + pre,
+                                                    )
+                                                });
+                                                ui.label(d.map(fmt_dur).unwrap_or_default());
+                                            }
+                                            None if s.aborted => {
+                                                ui.label(
+                                                    egui::RichText::new(tr("中断"))
+                                                        .color(p.muted),
+                                                );
+                                                ui.label("—");
+                                            }
+                                            None => {
+                                                ui.label(
+                                                    egui::RichText::new(tr("进行中"))
+                                                        .color(WARN),
+                                                );
+                                                ui.label("—");
+                                            }
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
+
+                if !live.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {}",
+                            tr("正在录制的通道"),
+                            live.iter().map(|s| s.channel.clone()).collect::<Vec<_>>().join("、")
+                        ))
+                        .size(11.0)
+                        .color(WARN),
+                    );
+                }
+
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.button(tr("事件目录")).clicked() {
+                        open_ev = true;
+                    }
+                    if ui.button(tr("全天目录")).clicked() {
+                        open_all = true;
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new(tr("报告根据日志生成，日志每天一个文件"))
+                            .size(10.5)
+                            .color(p.muted),
+                    );
+                });
+            });
+
+        if open_ev {
+            let _ = std::fs::create_dir_all(&ev_root);
+            let _ = crate::record::open_folder(&ev_root);
+        }
+        if open_all {
+            let _ = crate::record::open_folder(&all_root);
+        }
+        if !open {
+            self.show_events_report = false;
+        }
+    }
+
+    /// 许可须知弹窗：不勾选就不能下载，也不能启用识别。
+    fn notice_window(&mut self, ctx: &egui::Context) {
+        let Some(state) = self
+            .notice
+            .as_ref()
+            .map(|n| (n.id, n.agreed))
+        else {
+            return;
+        };
+        let (id, mut agreed) = state;
+        let spec = crate::model::by_id(id);
+        let p = self.pal();
+        // 已经有这个模型了（比如手动放进 models/ 的），同意之后只启用、不再下载
+        let installed = crate::model::installed_of(spec).is_some();
+
+        // 遮罩：挡住后面的点击，让弹窗成为真正的模态
+        let screen = ctx.content_rect();
+        egui::Area::new(egui::Id::unique("notice_dim"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(screen.size(), egui::Sense::click());
+                ui.painter()
+                    .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(170));
+            });
+
+        let mut cancel = false;
+        let mut open_license = false;
+        let mut accept_and_download = false;
+
+        egui::Window::new(tr("使用第三方识别模型"))
+            .id(egui::Id::unique("notice_window"))
+            .order(egui::Order::Foreground)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    egui::RichText::new(format!("{} {}", tr("模型："), spec.name))
+                        .strong(),
+                );
+                ui.label(format!(
+                    "{} {} · {} {}",
+                    tr("许可证："),
+                    spec.license.label(),
+                    tr("来源："),
+                    spec.vendor
+                ));
+                ui.add_space(8.0);
+
+                for line in [
+                    tr("该模型不属于本程序：我们不打包、不镜像、也不随软件分发它"),
+                    tr("下载地址指向模型作者与官方发布页，由你本人发起下载"),
+                    tr("AGPL-3.0 要求：分发基于该模型的衍生作品时需以 AGPL-3.0 开源"),
+                    tr("将本模型用于闭源商业产品或服务，需向模型作者购买商业授权"),
+                    tr("个人使用、学习研究、内部自用不受影响，可随时在设置里删除"),
+                ] {
+                    ui.label(egui::RichText::new(format!("· {line}")).size(12.0));
+                }
+
+                ui.add_space(8.0);
+                ui.label(
+                    egui::RichText::new(tr("下载后会校验 SHA-256，文件被篡改或不完整都会被拒绝。"))
+                        .size(11.0)
+                        .color(p.muted),
+                );
+                ui.add_space(10.0);
+
+                ui.checkbox(&mut agreed, tr("我已阅读并理解上述许可条款"));
+                ui.add_space(8.0);
+
+                ui.horizontal(|ui| {
+                    if ui.button(tr("取消")).clicked() {
+                        cancel = true;
+                    }
+                    if ui.button(tr("查看许可证")).clicked() {
+                        open_license = true;
+                    }
+                    ui.add_enabled_ui(agreed, |ui| {
+                        let label = if installed {
+                            tr("同意并启用")
+                        } else {
+                            tr("同意并下载")
+                        };
+                        if ui.button(label).clicked() {
+                            accept_and_download = true;
+                        }
+                    });
+                });
+            });
+
+        if open_license {
+            let _ = crate::sys::open_url("https://ultralytics.com/license");
+        }
+        if cancel {
+            self.notice = None;
+            return;
+        }
+        if let Some(n) = self.notice.as_mut() {
+            n.agreed = agreed;
+        }
+        if accept_and_download {
+            // 同意记录直接落到 cfg 并保存：这是"用户已知情"的证据，不能只留在草稿里
+            if !self.cfg.detect.accepted.iter().any(|m| m == spec.id) {
+                self.cfg.detect.accepted.push(spec.id.to_string());
+                let _ = self.cfg.save();
+            }
+            if !self.draft.detect.accepted.iter().any(|m| m == spec.id) {
+                self.draft.detect.accepted.push(spec.id.to_string());
+            }
+            let action = self
+                .notice
+                .as_ref()
+                .map(|n| n.action)
+                .unwrap_or(NoticeAction::Download);
+            self.notice = None;
+            match after_agree(installed, action) {
+                AfterAgree::EnableOnly => {
+                    self.toast(tr("已同意许可，模型已在本机，可以直接启用"));
+                }
+                AfterAgree::OpenBrowser => {
+                    let _ = crate::sys::open_url(spec.url);
+                }
+                AfterAgree::Download => {
+                    self.model_state = crate::model::spawn_download(spec);
+                    self.downloading_model = Some(spec.id.to_string());
+                }
+            }
+        }
+    }
+
+    /// 事件录像：给每个启用的通道起一路 tap。
+    /// 连续录制模式下不起，避免白占相机会话。
+    fn start_event_taps(&mut self) {
+        self.event_taps = (0..self.cfg.channels.len()).map(|_| None).collect();
+        self.event_hot_until = vec![None; self.cfg.channels.len()];
+        // 没有识别就没有触发源：这时候起 tap 只会白占一条相机会话
+        if self.cfg.record_mode != crate::config::RecordMode::Event {
+            return;
+        }
+        if !self.detection_running_with(&self.cfg) {
+            logs::append("事件录像", tr("未接入：识别未开启"));
+            return;
+        }
+        let Some(ff) = self.ffmpeg.clone() else {
+            logs::append("事件录像", tr("未接入：ffmpeg 未就绪"));
+            return;
+        };
+        // 事件片段放独立子目录，别和全天录像混在一起
+        let root = crate::record::events_root(&self.cfg);
+        let pre = self.cfg.event_pre_secs.clamp(2, 30);
+        for (i, ch) in self.cfg.channels.iter().enumerate() {
+            if !ch.enabled || ch.url.trim().is_empty() {
+                continue;
+            }
+            let spec = crate::eventrec::TapSpec {
+                ffmpeg: ff.clone(),
+                url: ch.rtsp(),
+                channel: ch.name.clone(),
+                root: root.clone(),
+                tcp: self.cfg.tcp,
+                pre_secs: pre,
+                merge_gap: Duration::from_secs(self.cfg.event_merge_gap_secs as u64),
+                max_clip: Duration::from_secs(self.cfg.event_max_clip_secs as u64),
+                start_delay: Duration::from_millis(120 * i as u64),
+            };
+            self.event_taps[i] = crate::eventrec::start(spec);
+            match self.event_taps[i] {
+                Some(_) => logs::append(&ch.name, tr("事件录像已接入")),
+                None => logs::append(&ch.name, tr("事件录像接入失败（端口或线程）")),
+            }
+        }
+    }
+
+    /// 把检测结果翻译成触发信号。每帧调一次：
+    /// `trigger` 只是把截止时间往后推，重复调用是幂等的。
+    fn tick_event_taps(&mut self) {
+        if self.cfg.record_mode != crate::config::RecordMode::Event {
+            return;
+        }
+        let post = Duration::from_secs(self.cfg.event_post_secs.clamp(1, 60) as u64);
+        let conf = self.cfg.event_conf;
+        for i in 0..self.event_taps.len() {
+            let Some(tap) = self.event_taps[i].as_ref() else {
+                continue;
+            };
+            // 看原始检测，不看画框：画框只标运动的，触发要看「存在」。
+            //
+            // 进出用迟滞判断：分数在阈值上下抖是常态，只用「≥ 阈值」当边沿
+            // 会一秒写好几条日志、并把触发窗口撕成碎片。进入要 ≥ 阈值，
+            // 退出则要求「完全没有检测」。
+            // 触发条件（这才是「该不该录」的判据）：
+            //   ① 有目标在动 —— 跟踪器筛过的，停着的车/摩托不算
+            //   ② 画面里有「人」—— 站着不动的人和走动的同等重要，
+            //      否则一个人往门口一站，录完 5 秒就停了
+            //
+            // 只看「有没有检出」是不行的：一辆停着的摩托会被持续检出，
+            // 那样事件录像就退化成 24 小时录制了。静止的车不算事件，
+            // 静止的人算——这是监控场景的常识。
+            let speed = self.detect.as_ref().map(|d| d.speed(i)).unwrap_or(0.0);
+            let moving = self
+                .detect
+                .as_ref()
+                .and_then(|d| d.moving(i))
+                .filter(|_| speed >= crate::detect::TRIGGER_SPEED);
+            let person = self
+                .detect
+                .as_ref()
+                .and_then(|d| d.raw_score(i))
+                .filter(|(label, score)| is_person(label) && *score >= conf);
+
+            let seen = moving
+                .map(|(l, s)| (l, s.max(person.map(|(_, p)| p).unwrap_or(0.0))))
+                .or(person);
+            let now = Instant::now();
+            let held = self
+                .event_hot_until
+                .get(i)
+                .and_then(|x| *x)
+                .map(|until| now < until)
+                .unwrap_or(false);
+            let hit = seen.is_some();
+
+            if hit {
+                tap.trigger(post);
+                if !held
+                    && let (Some((label, score)), Some(ch)) =
+                        (seen, self.cfg.channels.get(i))
+                {
+                    logs::append(
+                        &ch.name,
+                        &format!(
+                            "{} {label}（{score:.2}，{} {:.0}%/s）→ {}",
+                            tr("检出"),
+                            tr("速度"),
+                            speed * 100.0,
+                            tr("开始事件录像")
+                        ),
+                    );
+                }
+            }
+            if hit && self.event_hot_until.len() > i {
+                // 同一个事件在触发窗口内只记一条
+                self.event_hot_until[i] = Some(now + post);
+            }
+        }
+    }
+
+    /// 当前选中的模型是否已经装好、且许可已同意
+    fn model_ready_now(&self) -> bool {
+        self.model_ready_with(&self.cfg)
+    }
+
+    /// AGPL 模型没勾选过须知时返回 true
+    fn notice_pending(&self, spec: &crate::model::Spec) -> bool {
+        spec.license.needs_notice() && !self.cfg.detect.accepted.iter().any(|m| m == spec.id)
+    }
+
+    /// 模型装好了、许可也同意了（不看实验开关）
+    fn model_ready_with(&self, cfg: &crate::config::AppConfig) -> bool {
+        let spec = crate::model::by_id(&cfg.detect.model);
+        crate::model::installed_of(spec).is_some()
+            && !(spec.license.needs_notice()
+                && !cfg.detect.accepted.iter().any(|m| m == spec.id))
+    }
+
+    /// 识别真正可用：开关打开 + 模型就绪。
+    /// 事件录像完全依赖它，三处闸门（选择/启动/保存）都走这个判断。
+    fn detection_ready_with(&self, cfg: &crate::config::AppConfig) -> bool {
+        cfg.detect.enabled && self.model_ready_with(cfg)
+    }
+
+    /// 识别「此刻真的在跑」。
+    ///
+    /// 和 `detection_ready_with` 的区别是多了 `running`：功能开着但被用户在
+    /// 主界面关掉了，推理线程并没有跑。这时候再起事件录像的 tap，只会白占
+    /// 一条相机会话而永远不触发。
+    fn detection_running_with(&self, cfg: &crate::config::AppConfig) -> bool {
+        cfg.detect.running && self.detection_ready_with(cfg)
+    }
+
     /// ③ 实验：智能识别（默认关闭，模型按需下载）
     fn set_tab_lab(&mut self, ui: &mut egui::Ui) {
         let p = self.pal();
         let mut start_download = false;
         let mut remove_model = false;
+        let mut manual_download = false;
+        let mut open_folder = false;
+        let mut ask_notice: Option<NoticeAction> = None;
 
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(tr("实验功能")).size(13.0).strong());
+            section_title(ui, &p, tr("实验功能"));
             help(
                 ui,
                 tr("这里的玩意儿还在验证阶段：可能不稳定，也可能在后续版本里改掉或直接移除。\n用不上就别开，开了也不会影响录像和监看"),
@@ -3280,120 +4187,298 @@ impl CamNexusApp {
         });
         ui.add_space(8.0);
 
+        // ---------- 启用开关（放最上面，别让它掉到滚动区外） ----------
+        let hw = crate::sys::hardware();
+        let rec = crate::model::recommend(hw);
+        let sel = crate::model::by_id(&self.draft.detect.model);
+        let sel_file = crate::model::installed_of(sel);
+        let needs_notice = self.notice_pending(sel);
+        let ready = sel_file.is_some() && !needs_notice;
         // ---------- 开关 ----------
-        let ready = self.model_ready;
+        ui.add_space(10.0);
         egui::Frame::NONE
             .fill(p.card)
             .inner_margin(egui::Margin::same(10))
             .show(ui, |ui| {
                 ui.add_enabled_ui(ready, |ui| {
-                    if ui
+                    let changed = ui
                         .checkbox(&mut self.draft.detect.enabled, tr("启用智能识别"))
-                        .changed()
-                        && !self.draft.detect.enabled
-                    {
-                        // 关掉时顺手清空画面上残留的框
-                        if let Some(d) = self.detect.as_mut() {
+                        .changed();
+                    if changed {
+                        if self.draft.detect.enabled {
+                            // 刚启用这个功能：默认就让它跑起来
+                            self.draft.detect.running = true;
+                        } else if let Some(d) = self.detect.as_mut() {
                             d.results.clear();
                         }
                     }
                 });
                 if !ready {
-                    ui.label(
-                        egui::RichText::new(tr("需要先下载模型才能启用"))
-                            .size(11.0)
-                            .color(p.muted),
-                    );
+                    let why = if sel_file.is_none() {
+                        tr("需要先下载模型才能启用")
+                    } else {
+                        tr("需要先同意该模型的许可才能启用")
+                    };
+                    ui.label(egui::RichText::new(why).size(11.0).color(p.muted));
                 }
             });
 
-        ui.add_space(12.0);
-        ui.label(egui::RichText::new(tr("检测模型")).strong());
+
+        // ---------- 本机画像 ----------
+
+        egui::Frame::NONE
+            .fill(p.card)
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                section_title(ui, &p, tr("本机"));
+                ui.add_space(2.0);
+                // 拆两行：CPU 和显卡型号都很长，挤一行会糊成一团
+                ui.label(
+                    egui::RichText::new(format!("{} · {} 核", hw.cpu, hw.cores))
+                        .size(11.0)
+                        .color(p.muted),
+                );
+                ui.label(
+                    egui::RichText::new(&hw.gpu)
+                        .size(11.0)
+                        .color(p.muted),
+                );
+                let verdict = if hw.gpu_usable() {
+                    format!(
+                        "{} {:.1} TFLOPS → 推荐 {}",
+                        tr("可用显卡"),
+                        hw.gpu_tflops,
+                        rec.name
+                    )
+                } else {
+                    format!("{} → 推荐 {}", tr("按处理器估算"), rec.name)
+                };
+                ui.label(egui::RichText::new(verdict).size(11.0).color(p.muted));
+            });
+
+        ui.add_space(10.0);
+
+        // ---------- 模型选择 ----------
+        section_title(ui, &p, tr("检测模型"));
+        ui.add_space(4.0);
+        egui::ComboBox::from_id_salt("detect_model")
+            .width(260.0)
+            .selected_text(format!("{} · {}", sel.name, sel.license.label()))
+            .show_ui(ui, |ui| {
+                for m in crate::model::MODELS {
+                    let mut label = format!("{} · {}", m.name, m.license.label());
+                    if m.id == rec.id {
+                        label.push_str(&format!("  ★ {}", tr("推荐")));
+                    }
+                    if crate::model::installed_of(m).is_some() {
+                        label.push_str(&format!("  ✓ {}", tr("已安装")));
+                    }
+                    if ui
+                        .selectable_label(self.draft.detect.model == m.id, label)
+                        .clicked()
+                    {
+                        self.draft.detect.model = m.id.to_string();
+                    }
+                }
+            });
+
+        ui.add_space(4.0);
+        let est = crate::model::estimate_ms(sel, hw);
+        ui.label(
+            egui::RichText::new(format!(
+                "{} MB · {} · {} {:.0} ms（{} {:.0} ms）",
+                sel.size / 1_000_000,
+                sel.license.label(),
+                tr("本机预估"),
+                est,
+                tr("4 路约"),
+                est * 4.0
+            ))
+            .size(11.0)
+            .color(if est * 4.0 <= 1000.0 { p.muted } else { WARN }),
+        );
+
         ui.add_space(6.0);
 
-        // ---------- 模型状态 ----------
+        // ---------- 许可须知闸门 ----------
+        if self.notice_pending(sel) {
+            egui::Frame::NONE
+                .fill(p.card)
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(tr("这个模型采用 AGPL-3.0，启用前需要先阅读须知"))
+                            .size(11.5)
+                            .color(WARN),
+                    );
+                    ui.add_space(4.0);
+                    if ui.button(tr("阅读许可须知")).clicked() {
+                        self.notice = Some(NoticeUi {
+                            id: sel.id,
+                            agreed: false,
+                            action: NoticeAction::Download,
+                        });
+                    }
+                });
+            ui.add_space(6.0);
+        }
+
+        // ---------- 安装状态 ----------
         let state = self
             .model_state
             .lock()
             .map(|g| g.clone())
             .unwrap_or(crate::model::State::Idle);
+        let downloading_this = self.downloading_model.as_deref() == Some(sel.id);
 
         egui::Frame::NONE
             .fill(p.card)
             .inner_margin(egui::Margin::same(10))
-            .show(ui, |ui| match &state {
-                crate::model::State::Downloading { got, total } => {
-                    let frac = if *total > 0 {
-                        *got as f32 / *total as f32
-                    } else {
-                        0.0
-                    };
-                    ui.label(tr("正在下载模型…"));
-                    ui.add(
-                        egui::ProgressBar::new(frac)
-                            .show_percentage()
-                            .desired_width(ui.available_width()),
-                    );
-                }
-                crate::model::State::Verifying => {
-                    ui.label(tr("正在校验…"));
-                }
-                crate::model::State::Failed(e) => {
-                    ui.label(egui::RichText::new(e.clone()).size(11.5).color(ERR));
-                    if ui.button(tr("重试")).clicked() {
-                        start_download = true;
-                    }
-                }
-                _ => {
-                    if ready {
-                        ui.horizontal(|ui| {
-                            ui.label(tr("已安装"));
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{:.1} MB",
-                                    crate::model::SIZE as f64 / 1_000_000.0
-                                ))
-                                .size(11.0)
-                                .color(p.muted),
+            .show(ui, |ui| {
+                if downloading_this {
+                    match &state {
+                        crate::model::State::Downloading { got, total } => {
+                            let frac = if *total > 0 {
+                                *got as f32 / *total as f32
+                            } else {
+                                0.0
+                            };
+                            ui.label(tr("正在下载模型…"));
+                            ui.add(
+                                egui::ProgressBar::new(frac)
+                                    .show_percentage()
+                                    .desired_width(ui.available_width()),
                             );
-                            ui.add_space(6.0);
-                            if ui.button(tr("删除")).clicked() {
-                                remove_model = true;
-                            }
-                        });
-                    } else {
-                        ui.horizontal(|ui| {
-                            ui.label(tr("未下载"));
-                            ui.add_space(6.0);
-                            if ui.button(tr("下载模型")).clicked() {
+                        }
+                        crate::model::State::Verifying => {
+                            ui.label(tr("正在校验…"));
+                        }
+                        crate::model::State::Failed(e) => {
+                            ui.label(
+                                egui::RichText::new(e.clone()).size(11.5).color(ERR),
+                            );
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                if ui.button(tr("重试")).clicked() {
+                                    if needs_notice {
+                                        ask_notice = Some(NoticeAction::Download);
+                                    } else {
+                                        start_download = true;
+                                    }
+                                }
+                                if ui.button(tr("手动下载")).clicked() {
+                                    if needs_notice {
+                                        ask_notice = Some(NoticeAction::OpenBrowser);
+                                    } else {
+                                        manual_download = true;
+                                    }
+                                }
+                            });
+                        }
+                        _ => {
+                            ui.label(tr("下载完成"));
+                        }
+                    }
+                } else if sel_file.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.label(tr("已安装"));
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{:.1} MB",
+                                sel.size as f64 / 1_000_000.0
+                            ))
+                            .size(11.0)
+                            .color(p.muted),
+                        );
+                        ui.add_space(6.0);
+                        if ui.button(tr("删除")).clicked() {
+                            remove_model = true;
+                        }
+                        if ui.button(tr("打开文件夹")).clicked() {
+                            open_folder = true;
+                        }
+                    });
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.label(tr("未下载"));
+                        ui.add_space(6.0);
+                        if ui.button(tr("下载")).clicked() {
+                            if needs_notice {
+                                ask_notice = Some(NoticeAction::Download);
+                            } else {
                                 start_download = true;
                             }
-                            help(
-                                ui,
-                                tr("约 35.9 MB，从 YOLOX 官方发布地址下载并校验 SHA-256；\n装好的文件放在 %LOCALAPPDATA%\\CamNexus\\models，删掉软件也就干净了"),
-                            );
-                        });
-                    }
+                        }
+                        if ui.button(tr("手动下载")).clicked() {
+                            if needs_notice {
+                                ask_notice = Some(NoticeAction::OpenBrowser);
+                            } else {
+                                manual_download = true;
+                            }
+                        }
+                        if ui.button(tr("打开文件夹")).clicked() {
+                            open_folder = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} {}",
+                            tr("下载失败可手动放到："),
+                            crate::model::models_dir()
+                                .map(|d| d.display().to_string())
+                                .unwrap_or_default()
+                        ))
+                        .size(10.5)
+                        .color(p.muted),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("{} {}", tr("文件名必须是："), sel.file))
+                            .size(10.5)
+                            .color(p.muted),
+                    );
                 }
             });
 
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new(tr("模型：YOLOX-s · Apache-2.0"))
-                    .size(10.5)
-                    .color(p.muted),
-            );
-        });
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(format!(
+                "{} {} · {} · {} {}",
+                tr("来源"),
+                sel.vendor,
+                sel.url,
+                tr("备用源"),
+                if sel.fallback.is_empty() { tr("无") } else { tr("已配置") }
+            ))
+            .size(10.0)
+            .color(p.muted),
+        );
 
+        if let Some(action) = ask_notice {
+            self.notice = Some(NoticeUi {
+                id: sel.id,
+                agreed: false,
+                action,
+            });
+        }
         if start_download {
-            self.model_state = crate::model::spawn_download();
+            self.model_state = crate::model::spawn_download(sel);
+            self.downloading_model = Some(sel.id.to_string());
+        }
+        if manual_download {
+            let _ = crate::sys::open_url(sel.url);
+        }
+        if open_folder
+            && let Some(d) = crate::model::models_dir()
+        {
+            let _ = std::fs::create_dir_all(&d);
+            let _ = crate::sys::open_path(&d);
         }
         if remove_model {
-            match crate::model::remove() {
+            match crate::model::remove_of(sel) {
                 Ok(()) => {
-                    self.model_ready = false;
                     self.draft.detect.enabled = false;
+                    self.downloading_model = None;
                     if let Ok(mut g) = self.model_state.lock() {
                         *g = crate::model::State::Idle;
                     }
@@ -3404,13 +4489,11 @@ impl CamNexusApp {
         }
 
         // ---------- 参数（启用后才可调） ----------
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(8.0);
+        ui.add_space(5.0);
         ui.add_enabled_ui(self.draft.detect.enabled, |ui| {
             let gpu = self.draft.detect.device == crate::config::DetectDevice::Gpu;
 
-            ui.label(egui::RichText::new(tr("计算设备")).strong());
+            section_title(ui, &p, tr("计算设备"));
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui.selectable_label(!gpu, "CPU").clicked() {
@@ -3422,34 +4505,76 @@ impl CamNexusApp {
                 ui.add_space(6.0);
                 help(
                     ui,
-                    tr("CPU 单帧约 35 ms，显卡约 7 ms；CPU 模式固定 1 FPS，显卡可到 5 FPS"),
+                    tr("显卡把推理交给显卡做，上限 25 FPS；CPU 每帧要占一个核的时间片，上限 10 FPS。每帧实际耗时随模型不同，下面的负载估算会按本机算出来"),
                 );
             });
 
             ui.add_space(10.0);
-            ui.label(egui::RichText::new(tr("检测频率")).strong());
+            section_title(ui, &p, tr("检测频率"));
             ui.add_space(4.0);
+            let max_fps = self.draft.detect.max_fps();
             ui.horizontal(|ui| {
-                let mut fps = self.draft.detect.fps.clamp(1, 5);
-                ui.add_enabled_ui(gpu, |ui| {
-                    ui.add(
-                        egui::DragValue::new(&mut fps)
-                            .range(1..=5)
-                            .speed(0.2)
-                            .suffix(" FPS"),
-                    );
-                });
-                self.draft.detect.fps = fps.clamp(1, 5);
-                if !gpu {
-                    ui.label(
-                        egui::RichText::new(tr("（CPU 固定 1 FPS）"))
-                            .size(11.0)
-                            .color(p.muted),
-                    );
-                } else {
-                    help(ui, tr("频率越高响应越快，但更吃显卡；1–5 之间取整数"));
+                let mut fps = self.draft.detect.fps.clamp(1, max_fps);
+                ui.add(
+                    egui::DragValue::new(&mut fps)
+                        .range(1..=max_fps)
+                        .speed(0.2)
+                        .suffix(" FPS"),
+                );
+                self.draft.detect.fps = fps.clamp(1, max_fps);
+                let mut picked: Option<u32> = None;
+                for v in [3u32, 5, 8, 12, 15, 25] {
+                    if v > max_fps {
+                        continue;
+                    }
+                    if ui.small_button(v.to_string()).clicked() {
+                        picked = Some(v);
+                    }
                 }
+                if let Some(v) = picked {
+                    self.draft.detect.fps = v;
+                }
+                help(
+                    ui,
+                    if gpu {
+                        tr("频率越高框越跟手，但更吃显卡；上限 25（多数相机只有 12–25 帧/秒，再高也是重复帧）")
+                    } else {
+                        tr("CPU 每帧都要占一个核的时间片，上限 10；老机器建议 2–3")
+                    },
+                );
             });
+
+            // 本机负载估算：让用户在拖动之前就知道这台机器吃不吃得消
+            let est = crate::model::estimate_ms(sel, hw);
+            let fps = self.draft.detect.effective_fps() as f32;
+            let channels = self.cfg.channels.iter().filter(|c| c.enabled).count().max(1) as f32;
+            // 只有压在 CPU 上的那部分才算「占 CPU 单核」：
+            // 显卡模式下推理是显卡在跑，CPU 只管预处理和结果整理
+            let cpu_ms = crate::model::cpu_side_ms(sel, hw);
+            let load = cpu_ms * fps * channels / 10.0;
+            let text = i18n::detect_load(
+                est,
+                self.draft.detect.effective_fps(),
+                channels as u32,
+                load,
+            );
+            ui.label(
+                egui::RichText::new(text)
+                    .size(11.0)
+                    .color(if load > 100.0 { WARN } else { p.muted }),
+            )
+            .on_hover_text(tr(
+                "「CPU 单核」指处理器的一个逻辑核，和显卡的 CUDA 核心无关；显卡模式下 CPU 只做预处理，单帧约 2 ms",
+            ));
+            if load > 100.0 {
+                ui.label(
+                    egui::RichText::new(tr(
+                        "按这个频率跑不满 4 路，画面会丢帧；建议降低频率或换更小的模型",
+                    ))
+                    .size(10.5)
+                    .color(WARN),
+                );
+            }
 
             ui.add_space(10.0);
             ui.horizontal(|ui| {
@@ -3457,52 +4582,13 @@ impl CamNexusApp {
                 help(ui, tr("夜间识别不到目标时开启，会先增强对比度再推理"));
             });
 
-            ui.add_space(10.0);
-            ui.label(egui::RichText::new(tr("静止物体豁免")).strong());
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let cur = match self.draft.detect.static_grace_secs {
-                    0 => tr("关闭").to_string(),
-                    30 => tr("30 秒").to_string(),
-                    60 => tr("1 分钟").to_string(),
-                    300 => tr("5 分钟").to_string(),
-                    600 => tr("10 分钟").to_string(),
-                    v => i18n::seconds(v),
-                };
-                let mut pick: Option<u32> = None;
-                egui::ComboBox::from_id_salt("static_grace")
-                    .selected_text(cur)
-                    .width(110.0)
-                    .show_ui(ui, |ui| {
-                        for (v, label) in [
-                            (0u32, tr("关闭")),
-                            (30, tr("30 秒")),
-                            (60, tr("1 分钟")),
-                            (300, tr("5 分钟")),
-                            (600, tr("10 分钟")),
-                        ] {
-                            if ui
-                                .selectable_label(self.draft.detect.static_grace_secs == v, label)
-                                .clicked()
-                            {
-                                pick = Some(v);
-                            }
-                        }
-                    });
-                if let Some(v) = pick {
-                    self.draft.detect.static_grace_secs = v;
-                }
-                help(
-                    ui,
-                    tr("停放很久的车、站着不动的人会暂时不再画框，一旦移动立刻恢复"),
-                );
-            });
         });
     }
 
     /// ④ 画面：分辨率 / 解码 / 帧率 / 传输 / 音量
     fn set_tab_video(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new(tr("送显分辨率")).strong());
+        let p = self.pal();
+        section_title(ui, &p, tr("送显分辨率"));
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let cur = format!(
@@ -3535,7 +4621,7 @@ impl CamNexusApp {
         });
 
         ui.add_space(10.0);
-        ui.label(egui::RichText::new(tr("解码方式")).strong());
+        section_title(ui, &p, tr("解码方式"));
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let is_sw = self.draft.hwdec.is_empty() || self.draft.hwdec == "none";
@@ -3581,7 +4667,7 @@ impl CamNexusApp {
         });
 
         ui.add_space(10.0);
-        ui.label(egui::RichText::new(tr("帧率")).strong());
+        section_title(ui, &p, tr("帧率"));
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             let cur = if self.draft.fps == 0 {
@@ -3620,7 +4706,7 @@ impl CamNexusApp {
         });
 
         ui.add_space(10.0);
-        ui.label(egui::RichText::new(tr("音量")).strong());
+        section_title(ui, &p, tr("音量"));
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.add(
@@ -3695,11 +4781,9 @@ impl CamNexusApp {
             self.show_details = true;
         }
 
-        ui.add_space(14.0);
-        ui.separator();
-        ui.add_space(8.0);
+        ui.add_space(5.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(tr("启动与运行")).strong());
+            section_title(ui, &p, tr("启动与运行"));
             help(
                 ui,
                 tr("开机自启写在当前用户的启动项里，不需要管理员权限"),
@@ -3749,11 +4833,9 @@ impl CamNexusApp {
             self.draft.auto_record = false;
         }
 
-        ui.add_space(14.0);
-        ui.separator();
-        ui.add_space(8.0);
+        ui.add_space(5.0);
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("FFmpeg").strong());
+            section_title(ui, &p, "FFmpeg");
             help(
                 ui,
                 tr("留空则每次启动自动查找；找不到会提示下载精简版（约 79 MB）"),
@@ -3937,14 +5019,18 @@ impl CamNexusApp {
         if let Some((msg, _)) = &self.toast {
             let msg = msg.clone();
             let id = ui.make_persistent_id("toast");
+            // 宽度上限：不设的话 egui 按默认换行宽度折，长句子会折成好几行
+            let max_w = (ui.ctx().content_rect().width() - 80.0).clamp(240.0, 620.0);
             egui::Area::new(id)
                 .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
                 .show(ui.ctx(), |ui| {
+                    ui.set_max_width(max_w);
                     egui::Frame::NONE
-                        .fill(egui::Color32::from_rgb(30, 36, 46))
+                        .fill(p.toast_bg)
+                        .corner_radius(egui::CornerRadius::same(6))
                         .inner_margin(egui::Margin::symmetric(14, 8))
                         .show(ui, |ui| {
-                            ui.label(egui::RichText::new(msg).color(p.text));
+                            ui.label(egui::RichText::new(msg).color(p.toast_text).size(13.0));
                         });
                 });
         }
@@ -4334,6 +5420,22 @@ impl eframe::App for CamNexusApp {
         let ctx = ui.ctx().clone();
         let p = self.pal();
 
+        // 全屏切换可能是两步（先恢复最大化、再进全屏），这里推进它
+        self.poll_pending_fullscreen(&ctx);
+
+        // 启动时恢复识别：上次开着、功能仍启用、模型可用，就自动拉起。
+        // 崩溃后被守护进程重新拉起也走这条路，否则事件录像会静默失效。
+        if !self.detect_init {
+            self.detect_init = true;
+            if should_autostart_detect(&self.cfg.detect, self.model_ready_now()) {
+                self.detect =
+                    Some(DetectRuntime::spawn(ctx.clone(), self.cfg.detect.clone()));
+                logs::append("识别", tr("启动时自动开启识别"));
+            } else if self.cfg.detect.enabled {
+                logs::append("识别", tr("识别未自动开启（模型或许可不可用）"));
+            }
+        }
+
         // 原生标题栏主题：窗口创建时尚未显示，此时下发的 SetTheme 只改了配色，
         // 非客户区没有重绘（表现为「浅底白字」的标题栏），要等窗口交互才刷新。
         // 启动后补发几次，强制 Windows 重新计算标题栏。
@@ -4345,17 +5447,6 @@ impl eframe::App for CamNexusApp {
                 egui::SystemTheme::Light
             }));
             ctx.request_repaint();
-        }
-
-        // 下载完成后刷新可用状态（下载线程不会直接碰界面状态）
-        if !self.model_ready {
-            let done = matches!(
-                self.model_state.lock().map(|g| g.clone()),
-                Ok(crate::model::State::Done)
-            );
-            if done {
-                self.model_ready = crate::model::installed().is_some();
-            }
         }
 
         let detect_err = if let Some(d) = self.detect.as_mut() {
@@ -4467,6 +5558,9 @@ impl eframe::App for CamNexusApp {
 
         self.update_textures(&ctx);
         self.sample_metrics();
+        self.tick_event_taps();
+        self.events_report_window(&ctx);
+        self.notice_window(&ctx);
 
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.solo = None;
@@ -4641,6 +5735,26 @@ fn apply_style(ctx: &egui::Context, dark: bool) {
     ctx.style_mut_of(egui::Theme::Light, |style| customize_style(style, false));
 }
 
+/// 设置页的小节标题。
+///
+/// 不要用 `.strong()`：egui 的 strong 取的是 `widgets.active.fg_stroke`，
+/// 而那个颜色被设成白色（给主按钮的蓝底白字用的），于是浅色主题下
+/// 标题变成白字白底，整节内容看起来像凭空浮着。
+fn section_title(ui: &mut egui::Ui, p: &Pal, text: &str) {
+    ui.add_space(10.0);
+    ui.label(egui::RichText::new(text).size(13.0).color(p.text));
+}
+
+/// 这类目标「站着不动也算事件」，其余类别必须动起来才算。
+///
+/// 只有人例外：门口站个人是要录的，路边停辆摩托不该录。
+fn is_person(label: &str) -> bool {
+    label == "人"
+}
+
+// 样式字段是多层嵌套的（widgets.active.weak_bg_fill…），用结构体更新语法
+// 反而比逐条赋值更难读，所以这里显式放行这条 lint。
+#[allow(clippy::field_reassign_with_default)]
 fn customize_style(style: &mut egui::Style, dark: bool) {
     let p = palette(dark);
     let mut v = if dark {
@@ -4710,6 +5824,51 @@ fn customize_style(style: &mut egui::Style, dark: bool) {
 }
 
 #[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    /// 进程被杀时开着的片段没有「已保存」行，不能算「进行中」。
+    /// 之前今日报告里一堆「进行中」就是这个原因。
+    #[test]
+    fn restart_broken_spans_are_marked_aborted() {
+        let text = "- **10:00:00** [A] 事件片段开始录制
+- **10:01:00** 启动 v0.6.0（ffmpeg 路径略）
+- **10:02:00** [A] 事件片段开始录制
+- **10:02:30** [A] 事件片段已保存
+";
+        let s = parse_event_spans(text);
+        assert_eq!(s.len(), 2, "两次开录");
+        assert!(s[0].end.is_none() && s[0].aborted, "重启前那段应标为中断");
+        assert!(s[1].end.is_some() && !s[1].aborted, "重启后那段正常收尾");
+    }
+
+    /// 日志里带真实秒数时，报告用它而不是「结束-开始」
+    #[test]
+    fn uses_logged_duration_when_present() {
+        let text = "- **09:00:00** [A] 事件片段开始录制
+- **09:00:41** [A] 事件片段已保存（17 秒）
+";
+        let s = parse_event_spans(text);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].secs, Some(17), "应取日志里的 17 秒");
+        assert_eq!(saved_secs("事件片段已保存（17 秒）"), Some(17));
+        assert_eq!(saved_secs("事件片段已保存（并入上一段）"), None);
+    }
+
+    /// 正常开合不受影响
+    #[test]
+    fn normal_span_pairs_up() {
+        let text = "- **09:00:00** [A] 事件片段开始录制
+- **09:00:40** [A] 事件片段已保存
+";
+        let s = parse_event_spans(text);
+        assert_eq!(s.len(), 1);
+        assert_eq!(s[0].end.as_deref(), Some("09:00:40"));
+        assert!(!s[0].aborted);
+    }
+}
+
+#[cfg(test)]
 mod sig_tests {
     use super::*;
     use crate::config::Channel;
@@ -4719,17 +5878,16 @@ mod sig_tests {
     #[test]
     fn help_mark_is_hoverable() {
         let ctx = egui::Context::default();
-        let base = || {
-            let mut input = egui::RawInput::default();
-            input.screen_rect = Some(egui::Rect::from_min_size(
+        let base = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
                 egui::pos2(0.0, 0.0),
                 egui::vec2(800.0, 600.0),
-            ));
-            input
+            )),
+            ..Default::default()
         };
         // 固定位置，避免 Area 在两帧之间漂移导致指针落空
         let area = || {
-            egui::Area::new(egui::Id::new("probe"))
+            egui::Area::new(egui::Id::unique("probe"))
                 .fixed_pos(egui::pos2(40.0, 40.0))
                 .order(egui::Order::Foreground)
         };
@@ -4778,8 +5936,10 @@ mod sig_tests {
     /// 子码流只影响监看：改它需要重连，但不该影响录制用的主码流地址
     #[test]
     fn substream_changes_require_reconnect() {
-        let mut a = AppConfig::default();
-        a.channels = vec![ch(tr("镜头1"), "rtsp://1.2.3.4/Streaming/Channels/101")];
+        let a = AppConfig {
+            channels: vec![ch(tr("镜头1"), "rtsp://1.2.3.4/Streaming/Channels/101")],
+            ..Default::default()
+        };
         assert!(!stream_sig(&a).is_empty());
 
         let before = stream_sig(&a);
@@ -4820,8 +5980,10 @@ mod sig_tests {
 
     #[test]
     fn renaming_channel_does_not_require_reconnect() {
-        let mut a = AppConfig::default();
-        a.channels = vec![ch(tr("镜头1"), "rtsp://1.2.3.4/101")];
+        let a = AppConfig {
+            channels: vec![ch(tr("镜头1"), "rtsp://1.2.3.4/101")],
+            ..Default::default()
+        };
         let mut b = a.clone();
         b.channels[0].name = tr("大门").into();
         assert_eq!(stream_sig(&a), stream_sig(&b), "改通道名不应触发重连");
@@ -4829,8 +5991,10 @@ mod sig_tests {
 
     #[test]
     fn changing_url_or_decode_requires_reconnect() {
-        let mut a = AppConfig::default();
-        a.channels = vec![ch(tr("镜头1"), "rtsp://1.2.3.4/101")];
+        let a = AppConfig {
+            channels: vec![ch(tr("镜头1"), "rtsp://1.2.3.4/101")],
+            ..Default::default()
+        };
 
         let mut b = a.clone();
         b.channels[0].url = "rtsp://1.2.3.4/102".into();
@@ -4867,7 +6031,7 @@ pub struct DetectRuntime {
     /// 模型加载失败的说明，界面取走后清空（用于弹一次提示）
     pub error: Option<String>,
     tx: std::sync::mpsc::SyncSender<DetectJob>,
-    rx: std::sync::mpsc::Receiver<(usize, Vec<Detection>)>,
+    rx: std::sync::mpsc::Receiver<(usize, Vec<Detection>, f32, &'static str, f32)>,
     /// 后台线程回报的错误（空串 = 加载成功）
     st_rx: std::sync::mpsc::Receiver<String>,
     /// 后台线程随时更新的状态文案
@@ -4875,6 +6039,11 @@ pub struct DetectRuntime {
     last_sent: std::collections::HashMap<usize, Instant>,
     /// 每路的检测结果与时间戳
     pub results: std::collections::HashMap<usize, (Vec<Detection>, Instant)>,
+    /// 每路的「原始检测最高分」与时间戳。事件录制看这个，
+    /// 不受画框的运动筛选影响。
+    raw_max: std::collections::HashMap<usize, (f32, &'static str, Instant)>,
+    /// 每路最近一轮的最大运动速度（归一化宽度/秒）
+    speeds: std::collections::HashMap<usize, (f32, Instant)>,
 }
 
 impl DetectRuntime {
@@ -4884,28 +6053,27 @@ impl DetectRuntime {
         // 有界队列：一帧是整张原图（2560×1440 ≈ 11MB），多路高帧率下如果
         // 推理跟不上，无界 channel 会把内存吃掉；满了就丢帧，绝不阻塞 UI。
         let (tx, job_rx) = std::sync::mpsc::sync_channel::<DetectJob>(2);
-        let (res_tx, rx) = std::sync::mpsc::channel::<(usize, Vec<Detection>)>();
+        let (res_tx, rx) = std::sync::mpsc::channel::<(usize, Vec<Detection>, f32, &'static str, f32)>();
         let (st_tx, st_rx) = std::sync::mpsc::channel::<String>();
         let status_slot = std::sync::Arc::new(std::sync::Mutex::new(String::from(tr("正在加载模型…"))));
         let slot = status_slot.clone();
+        let cfg_thread = cfg.clone();
 
         std::thread::Builder::new()
             .name("detect".into())
             .spawn(move || {
-                // yolox_s(640) 优先，其次 yolox_tiny(416)
-                let (path, size) = match crate::detect::find_model("yolox_s.onnx") {
-                    Some(p) => (p, 640usize),
-                    None => match crate::detect::find_model("yolox_tiny.onnx") {
-                        Some(p) => (p, 416),
-                        None => {
-                            if let Ok(mut g) = slot.lock() {
-                                *g = tr("未找到模型文件（models/yolox_s.onnx）").to_string();
-                            }
-                            let _ = st_tx.send(tr("未找到模型文件").to_string());
-                            ctx.request_repaint();
-                            return;
-                        }
-                    },
+                let cfg = cfg_thread;
+                // 用设置里选中的那个模型；找不到就报清楚是哪一个
+                let spec = crate::model::by_id(&cfg.model);
+                let size = spec.input;
+                let Some(path) = crate::model::installed_of(spec) else {
+                    let msg = format!("{}（{}）", tr("未找到模型文件"), spec.file);
+                    if let Ok(mut g) = slot.lock() {
+                        *g = msg.clone();
+                    }
+                    let _ = st_tx.send(msg);
+                    ctx.request_repaint();
+                    return;
                 };
                 let mut det = match crate::detect::Detector::load_with(
                     &path,
@@ -4935,12 +6103,23 @@ impl DetectRuntime {
                 let _ = st_tx.send(String::new());
 
                 // 每路一份跟踪器：共用会让 A 的框漂到 B 的画面上
-                let mut trackers = crate::detect::Trackers::new(&cfg);
+                let mut trackers = crate::detect::Trackers::new();
                 while let Ok((idx, data, w, h)) = job_rx.recv() {
                     if let Ok(raw) = det.detect(&data, w, h, 0.35) {
-                        // 静止豁免在这里生效：长时间不动的目标不再输出
+                        // 原始检测的最高分：画框只标运动目标，但事件录制要看到
+                        // 「有人/车存在」——站着不动、被短暂遮挡后重新出现都算。
+                        let (raw_max, raw_label) = raw
+                            .iter()
+                            .fold((0.0f32, ""), |acc, d| {
+                                if d.score > acc.0 {
+                                    (d.score, d.label)
+                                } else {
+                                    acc
+                                }
+                            });
                         let shown = trackers.update(idx, &raw, std::time::Instant::now());
-                        let _ = res_tx.send((idx, shown));
+                        let spd = trackers.speed(idx);
+                        let _ = res_tx.send((idx, shown, raw_max, raw_label, spd));
                         ctx.request_repaint();
                     }
                 }
@@ -4958,13 +6137,21 @@ impl DetectRuntime {
             status_slot,
             last_sent: std::collections::HashMap::new(),
             results: std::collections::HashMap::new(),
+            raw_max: std::collections::HashMap::new(),
+            speeds: std::collections::HashMap::new(),
         }
     }
 
     /// 每帧收结果 + 刷新状态
     pub fn poll(&mut self) {
-        while let Ok((idx, dets)) = self.rx.try_recv() {
+        while let Ok((idx, dets, raw_max, raw_label, spd)) = self.rx.try_recv() {
             self.results.insert(idx, (dets, Instant::now()));
+            self.raw_max.insert(idx, (raw_max, raw_label, Instant::now()));
+            // 速度是每 400ms 结算一次，其余轮次是 0；只写非零值，
+            // 让「刚才在动」这个判断保持 2 秒，否则迟滞会被打断
+            if spd > 0.0 {
+                self.speeds.insert(idx, (spd, Instant::now()));
+            }
         }
         // 加载是异步的：状态文案每帧同步一次，否则会永远停在「正在加载模型…」
         if let Ok(g) = self.status_slot.lock()
@@ -4978,7 +6165,7 @@ impl DetectRuntime {
         }
     }
 
-    /// 到点就送一帧去检测（频率由设置决定：CPU 1 fps，显卡 1–5 fps）
+    /// 到点就送一帧去检测（频率由设置决定：CPU 上限 10 FPS、显卡上限 25 FPS）
     pub fn maybe_submit(&mut self, idx: usize, data: std::sync::Arc<Vec<u8>>, w: usize, h: usize) {
         if !self.enabled || w == 0 || h == 0 {
             return;
@@ -5006,10 +6193,356 @@ impl DetectRuntime {
     }
 
     /// 某一路当前有效的检测结果（3 秒内）
+    /// 这一路最近是否检出过达到阈值的目标（不看运动筛选）。
+    /// 事件录制的触发用它：站着不动的人、被遮挡后重新出现的目标都能立刻续上。
+    /// 运动目标里分数最高的一条。这些是**跟踪器筛过**的目标，
+    /// 停着不动的车不会出现在这里。
+    pub fn moving(&self, idx: usize) -> Option<(&'static str, f32)> {
+        let (dets, at) = self.results.get(&idx)?;
+        if at.elapsed() >= std::time::Duration::from_secs(2) {
+            return None;
+        }
+        dets.iter()
+            .max_by(|a, b| a.score.total_cmp(&b.score))
+            .map(|d| (d.label, d.score))
+    }
+
+    /// 该通道最近一轮的最大运动速度（归一化宽度/秒）
+    pub fn speed(&self, idx: usize) -> f32 {
+        self.speeds
+            .get(&idx)
+            .filter(|(_, at)| at.elapsed() < std::time::Duration::from_secs(2))
+            .map(|(v, _)| *v)
+            .unwrap_or(0.0)
+    }
+
+    /// 最近的原始检测（类别, 分数），只看新鲜度不看阈值
+    pub fn raw_score(&self, idx: usize) -> Option<(&'static str, f32)> {
+        self.raw_max
+            .get(&idx)
+            .filter(|(_, _, at)| at.elapsed() < std::time::Duration::from_secs(2))
+            .map(|(score, label, _)| (*label, *score))
+    }
+
     pub fn active(&self, idx: usize) -> Option<&Vec<Detection>> {
         self.results
             .get(&idx)
             .filter(|(_, at)| at.elapsed() < std::time::Duration::from_secs(3))
             .map(|(v, _)| v)
+    }
+}
+
+
+
+
+/// 启动时该不该自动开识别。
+///
+/// 三个条件缺一不可：功能开着（设置里的实验开关）、上次退出时是开着的、
+/// 模型已就绪。单独抽出来是为了能穷举验证——这条判断错了，
+/// 崩溃重启后事件录像会静默失效，很难发现。
+fn should_autostart_detect(cfg: &crate::config::DetectCfg, model_ready: bool) -> bool {
+    cfg.enabled && cfg.running && model_ready
+}
+
+/// 报告窗口的缓存：日志解析和目录扫描都不便宜，别每帧做
+struct ReportCache {
+    at: std::time::Instant,
+    day: String,
+    spans: Vec<EvSpan>,
+    /// 每路：（文件数, 总秒数）
+    totals: Vec<(u32, u64)>,
+}
+
+/// 日志里的一段事件
+#[derive(Debug, PartialEq)]
+struct EvSpan {
+    channel: String,
+    start: String,
+    /// 还没结束（正在录或没写结束行）时为 None
+    end: Option<String>,
+    /// 进程重启时还开着：不算「进行中」，是中断
+    aborted: bool,
+    /// 日志里记的真实写入秒数。没写的老日志回退到「结束-开始+预录」
+    secs: Option<u32>,
+}
+
+/// 从当天日志里解析出事件时段。
+///
+/// 只认我们自己写的两种行：
+///   `- **16:44:31** [海康 镜头1] 事件片段开始录制`
+///   `- **16:45:10** [海康 镜头1] 事件片段已保存`（可能带「（并入上一段）」）
+fn parse_event_spans(text: &str) -> Vec<EvSpan> {
+    let mut spans: Vec<EvSpan> = Vec::new();
+    // 每个通道「还没收尾的那几段」的下标，先进先出。
+    // 早先用的是线性查找，4000 行日志要 11 ms（O(n²)），改队列后是线性的。
+    let mut open: std::collections::HashMap<&str, std::collections::VecDeque<usize>> =
+        std::collections::HashMap::new();
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("- **") else {
+            continue;
+        };
+        let Some((time, tail)) = rest.split_once("**") else {
+            continue;
+        };
+        let tail = tail.trim_start();
+        // 启动行没有 [通道] 前缀，先单独处理：
+        // 上一个进程被杀时还开着的片段永远不会写「已保存」，
+        // 不标记的话它们会一直显示成「进行中」。
+        if tail.starts_with("启动 v") {
+            for q in open.values_mut() {
+                for i in q.drain(..) {
+                    spans[i].aborted = true;
+                }
+            }
+            continue;
+        }
+        let Some(rest) = tail.strip_prefix('[') else {
+            continue;
+        };
+        let Some((channel, msg)) = rest.split_once("] ") else {
+            continue;
+        };
+        if msg.starts_with("事件片段开始录制") {
+            open.entry(channel).or_default().push_back(spans.len());
+            spans.push(EvSpan {
+                channel: channel.to_string(),
+                start: time.to_string(),
+                end: None,
+                aborted: false,
+                secs: None,
+            });
+        } else if msg.starts_with("事件片段已保存")
+            && let Some(i) = open.get_mut(channel).and_then(|q| q.pop_front())
+        {
+            spans[i].end = Some(time.to_string());
+            spans[i].secs = saved_secs(msg);
+        }
+    }
+    spans
+}
+
+/// 从「事件片段已保存（17 秒）」里取真实写入秒数。
+///
+/// 片段实际只写触发窗口内的画面（续接窗口里的空等不再写入），
+/// 用「结束时间 - 开始时间」算会把空等也算进去，动辄多出几十秒。
+fn saved_secs(msg: &str) -> Option<u32> {
+    let a = msg.find('（')? + '（'.len_utf8();
+    let b = msg[a..].find(" 秒")? + a;
+    msg[a..b].trim().parse().ok()
+}
+
+/// `16:45:10` → 当日秒数
+fn hms_secs(s: &str) -> Option<u32> {
+    let mut it = s.split(':');
+    let h: u32 = it.next()?.parse().ok()?;
+    let m: u32 = it.next()?.parse().ok()?;
+    let sec: u32 = it.next()?.parse().ok()?;
+    Some(h * 3600 + m * 60 + sec)
+}
+
+/// 秒 → `1 小时 02 分` / `3 分 12 秒`
+fn fmt_dur(secs: u32) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    if h > 0 {
+        format!("{h} 小时 {m:02} 分")
+    } else if m > 0 {
+        format!("{m} 分 {s:02} 秒")
+    } else {
+        format!("{s} 秒")
+    }
+}
+
+/// 把这次保存改动过的项写进日志。
+///
+/// 刻意逐项对比而不是整段 dump：日志是给人看的，一串 JSON 没人会读。
+fn log_settings_change(old: &AppConfig, new: &AppConfig) {
+    let mut items: Vec<String> = Vec::new();
+    let mut push = |name: &str, from: String, to: String| {
+        items.push(format!("{name}: {from} → {to}"));
+    };
+
+    if old.channels.len() != new.channels.len() {
+        push(
+            "通道数",
+            old.channels.len().to_string(),
+            new.channels.len().to_string(),
+        );
+    }
+    for (i, (a, b)) in old.channels.iter().zip(new.channels.iter()).enumerate() {
+        if a.name != b.name || a.url != b.url || a.enabled != b.enabled {
+            push(
+                &format!("通道 {}", i + 1),
+                format!("{} ({})", a.name, if a.enabled { "启用" } else { "停用" }),
+                format!("{} ({})", b.name, if b.enabled { "启用" } else { "停用" }),
+            );
+        }
+    }
+    if (old.render_width, old.render_height) != (new.render_width, new.render_height) {
+        push(
+            "送显分辨率",
+            format!("{}×{}", old.render_width, old.render_height),
+            format!("{}×{}", new.render_width, new.render_height),
+        );
+    }
+    if old.tcp != new.tcp {
+        push("RTSP 传输", old.tcp.to_string(), new.tcp.to_string());
+    }
+    if old.hwdec != new.hwdec {
+        push("硬件解码", old.hwdec.clone(), new.hwdec.clone());
+    }
+    if old.record_mode != new.record_mode {
+        push(
+            "录像方式",
+            format!("{:?}", old.record_mode),
+            format!("{:?}", new.record_mode),
+        );
+    }
+    if old.record_max_mb != new.record_max_mb {
+        push(
+            "录制容量上限",
+            format!("{} GB", old.record_max_mb / 1024),
+            format!("{} GB", new.record_max_mb / 1024),
+        );
+    }
+    if old.detect.enabled != new.detect.enabled {
+        push("智能识别", old.detect.enabled.to_string(), new.detect.enabled.to_string());
+    }
+    if old.detect.model != new.detect.model {
+        push("识别模型", old.detect.model.clone(), new.detect.model.clone());
+    }
+    if old.detect.device != new.detect.device {
+        push(
+            "识别设备",
+            format!("{:?}", old.detect.device),
+            format!("{:?}", new.detect.device),
+        );
+    }
+    if old.detect.fps != new.detect.fps {
+        push(
+            "检测频率",
+            format!("{} FPS", old.detect.fps),
+            format!("{} FPS", new.detect.fps),
+        );
+    }
+    if old.event_pre_secs != new.event_pre_secs {
+        push(
+            "事件缓冲",
+            format!("{} 秒", old.event_pre_secs),
+            format!("{} 秒", new.event_pre_secs),
+        );
+    }
+    if old.event_post_secs != new.event_post_secs {
+        push(
+            "事件续录",
+            format!("{} 秒", old.event_post_secs),
+            format!("{} 秒", new.event_post_secs),
+        );
+    }
+    if old.event_merge_gap_secs != new.event_merge_gap_secs {
+        push(
+            "片段合并间隔",
+            format!("{} 秒", old.event_merge_gap_secs),
+            format!("{} 秒", new.event_merge_gap_secs),
+        );
+    }
+    if old.lang != new.lang {
+        push("界面语言", format!("{:?}", old.lang), format!("{:?}", new.lang));
+    }
+
+    if items.is_empty() {
+        return;
+    }
+    crate::logs::append("设置", tr("设置已更改"));
+    for it in items {
+        crate::logs::append("设置", &format!("· {it}"));
+    }
+}
+
+
+    #[test]
+    fn event_spans_are_paired_from_log() {
+        let log = "- **16:44:31** [镜头1] 事件片段开始录制
+- **16:44:39** [镜头1] 事件片段已保存（并入上一段）
+- **16:50:02** [镜头1] 事件片段开始录制
+- **16:50:30** [镜头1] 事件片段已保存
+- **16:51:00** [镜头2] 事件片段开始录制
+- **16:52:00** [设置] 设置已更改
+";
+        let spans = parse_event_spans(log);
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].channel, "镜头1");
+        assert_eq!(spans[0].start, "16:44:31");
+        assert_eq!(spans[0].end.as_deref(), Some("16:44:39"));
+        assert_eq!(spans[1].start, "16:50:02");
+        assert_eq!(spans[1].end.as_deref(), Some("16:50:30"));
+        // 第三段还在录：没有结束时间
+        assert_eq!(spans[2].channel, "镜头2");
+        assert_eq!(spans[2].end, None);
+    }
+
+    #[test]
+    fn duration_formatting() {
+        assert_eq!(fmt_dur(5), "5 秒");
+        assert_eq!(fmt_dur(65), "1 分 05 秒");
+        assert_eq!(fmt_dur(3720), "1 小时 02 分");
+        assert_eq!(hms_secs("01:02:03"), Some(3723));
+        assert_eq!(hms_secs("坏了"), None);
+    }
+
+
+
+
+    #[test]
+    fn autostart_needs_all_three_conditions() {
+        let base = || crate::config::DetectCfg {
+            enabled: true,
+            running: true,
+            ..Default::default()
+        };
+        assert!(should_autostart_detect(&base(), true));
+        // 功能没启用
+        assert!(!should_autostart_detect(
+            &crate::config::DetectCfg { enabled: false, ..base() },
+            true
+        ));
+        // 上次是关着的
+        assert!(!should_autostart_detect(
+            &crate::config::DetectCfg { running: false, ..base() },
+            true
+        ));
+        // 模型不可用
+        assert!(!should_autostart_detect(&base(), false));
+    }
+
+#[cfg(test)]
+mod agree_tests {
+    use super::*;
+
+    #[test]
+    fn installed_model_is_never_downloaded_again() {
+        // 手动放进 models/ 的模型：点「同意」只启用，不重新下载
+        assert_eq!(
+            after_agree(true, NoticeAction::Download),
+            AfterAgree::EnableOnly
+        );
+        // 手动下载按钮同样不该再打开浏览器
+        assert_eq!(
+            after_agree(true, NoticeAction::OpenBrowser),
+            AfterAgree::EnableOnly
+        );
+    }
+
+    #[test]
+    fn missing_model_follows_the_original_action() {
+        assert_eq!(
+            after_agree(false, NoticeAction::Download),
+            AfterAgree::Download
+        );
+        assert_eq!(
+            after_agree(false, NoticeAction::OpenBrowser),
+            AfterAgree::OpenBrowser
+        );
     }
 }

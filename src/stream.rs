@@ -64,6 +64,8 @@ pub struct StreamCfg {
     pub hwdec: String,
     /// 是否让这条流顺带产出音频（省掉单独一路 RTSP 会话）
     pub audio: bool,
+    /// 通道名，只用于写日志
+    pub name: String,
     /// 启动前等这么久再建连。多路同时拉起会给相机和 CPU 造成尖峰，
     /// 错开一点，界面也不用为此阻塞。
     pub start_delay: Duration,
@@ -101,6 +103,10 @@ pub struct Stream {
     thread: Option<std::thread::JoinHandle<()>>,
     child: Arc<Mutex<Option<Child>>>,
     cpu: Mutex<crate::sys::CpuMeter>,
+    /// 通道名，只用于写日志
+    name: String,
+    /// 上一次观察到的状态，用来只在「变化时」记一条日志
+    last_state: Mutex<Option<State>>,
 }
 
 impl Stream {
@@ -134,6 +140,8 @@ impl Stream {
             thread,
             child,
             cpu: Mutex::new(crate::sys::CpuMeter::default()),
+            name: cfg.name.clone(),
+            last_state: Mutex::new(None),
         }
     }
 
@@ -189,6 +197,30 @@ impl Stream {
     /// 不这么做的话，摄像机假死时 `State::Live` 会一直保持，
     /// 界面显示「在线 + 旧帧率」和一张冻结的旧画面，等于在骗人。
     pub fn tick(&self) {
+        // 状态变了才写日志：连接中 → 直播 / 直播 → 重连 / 重连 → 恢复
+        if let Ok(s) = self.status.lock() {
+            let cur = s.state;
+            let mut last = self.last_state.lock().unwrap_or_else(|e| e.into_inner());
+            if last.as_ref() != Some(&cur) {
+                match cur {
+                    State::Live => {
+                        if last.is_some() {
+                            crate::logs::append(&self.name, tr("画面已恢复"));
+                        }
+                    }
+                    State::Reconnecting => {
+                        crate::logs::append(&self.name, tr("画面卡住，正在重连"));
+                    }
+                    State::Connecting => {
+                        if last.is_some() {
+                            crate::logs::append(&self.name, tr("正在重新连接"));
+                        }
+                    }
+                }
+                *last = Some(cur);
+            }
+        }
+
         let stalled = match self.status.lock() {
             Ok(s) => {
                 s.state == State::Live

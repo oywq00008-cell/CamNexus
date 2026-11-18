@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn level_reflects_amplitude() {
         let b = AudioBuf::default();
-        b.push(&vec![16384i16; 100]); // 半幅
+        b.push(&[16384i16; 100]); // 半幅
         let lv = b.level();
         assert!((lv - 0.5).abs() < 0.02, "RMS 应约等于 0.5，实际 {lv}");
     }

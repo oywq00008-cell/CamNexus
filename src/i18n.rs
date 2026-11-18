@@ -114,12 +114,6 @@ pub fn channel_n(n: usize) -> String {
     }
 }
 
-pub fn seconds(s: u32) -> String {
-    match lang() {
-        Lang::Zh => format!("{s} 秒"),
-        Lang::En => format!("{s} s"),
-    }
-}
 
 pub fn reconnect_n(n: impl std::fmt::Display) -> String {
     match lang() {
@@ -283,28 +277,33 @@ pub fn cpu_suffix() -> &'static str {
     }
 }
 
-pub fn static_grace(secs: u32) -> String {
+
+
+/// 「3 段事件」
+pub fn event_count(n: u32) -> String {
     match lang() {
-        Lang::Zh => match secs {
-            0 => "关闭".into(),
-            s if s % 60 == 0 => format!("{} 分钟", s / 60),
-            s => format!("{s} 秒"),
-        },
-        Lang::En => match secs {
-            0 => "Off".into(),
-            s if s % 60 == 0 => format!("{} min", s / 60),
-            s => format!("{s} s"),
-        },
+        Lang::Zh => format!("{n} 段"),
+        Lang::En => format!("{n} clips"),
     }
 }
 
-pub fn detect_tip(fps: u32, dev: &str, grace: &str) -> String {
+/// 检测负载估算：本机单帧耗时 + N 路并发占单核多少
+pub fn detect_load(ms: f32, fps: u32, channels: u32, load: f32) -> String {
     match lang() {
         Lang::Zh => format!(
-            "按 {fps} FPS 抽帧做人体/车辆识别（{dev}），结果画在画面上\n静止物体豁免：{grace}"
+            "本机预估 {ms:.0} ms/帧 · {channels} 路 @ {fps} FPS 约占 CPU 单核 {load:.0}%"
         ),
         Lang::En => format!(
-            "Sample frames at {fps} FPS for person/vehicle detection ({dev}); boxes are drawn on the video\nStatic-object grace: {grace}"
+            "≈{ms:.0} ms/frame here · {channels} channels @ {fps} FPS ≈ {load:.0}% of one CPU core"
+        ),
+    }
+}
+
+pub fn detect_tip(fps: u32, dev: &str) -> String {
+    match lang() {
+        Lang::Zh => format!("按 {fps} FPS 抽帧做人体/车辆识别（{dev}），只标出在动的目标"),
+        Lang::En => format!(
+            "Sample frames at {fps} FPS for person/vehicle detection ({dev}); only moving targets are boxed"
         ),
     }
 }
@@ -561,7 +560,6 @@ const PAIRS: &[(&str, &str)] = &[
     ("图片编码失败", "Image encoding failed"),
     ("创建快照目录失败", "Cannot create snapshot folder"),
     ("保存快照失败", "Cannot save snapshot"),
-    ("正在重新连接", "Reconnecting"),
     ("旋转预览", "Rotation (preview)"),
     ("不旋转", "None"),
     ("顺时针 90°", "90° clockwise"),
@@ -612,8 +610,8 @@ const PAIRS: &[(&str, &str)] = &[
     ("每通道录制参数", "Per-channel recording"),
     ("默认跟随送显分辨率；画质越高越清晰、占空间也越大", "Follows the display resolution by default; higher quality looks better and takes more space"),
     ("H.265 同画质体积约省 40%，但部分系统需装 HEVC 解码包才能播；\nH.264 兼容性最好，任何播放器都能播，代价是文件更大", "H.265: about 40% smaller at the same quality, but some systems need the HEVC codec pack to play it.\nH.264: plays anywhere, at the cost of larger files"),
-    ("CPU 单帧约 35 ms，显卡约 7 ms；CPU 模式固定 1 FPS，显卡可到 5 FPS", "About 35 ms per frame on CPU vs 7 ms on GPU. CPU is fixed at 1 FPS; GPU can go up to 5 FPS"),
-    ("频率越高响应越快，但更吃显卡；1–5 之间取整数", "Higher means faster reaction but more GPU load. Integer values from 1 to 5"),
+    ("显卡把推理交给显卡做，上限 25 FPS；CPU 每帧要占一个核的时间片，上限 10 FPS。每帧实际耗时随模型不同，下面的负载估算会按本机算出来",
+     "The GPU does the inference (up to 25 FPS); on CPU each frame takes a slice of a core (up to 10 FPS). The real per-frame cost depends on the model — the load estimate below is computed for this machine"),
     ("夜间识别不到目标时开启，会先增强对比度再推理", "Enable if targets are missed at night — contrast is boosted before inference"),
     ("停放很久的车、站着不动的人会暂时不再画框，一旦移动立刻恢复", "Cars parked or people standing still stop being boxed after a while; the box returns as soon as they move"),
     ("网格模式每格的实际像素远小于此值，调高只在双击放大单路时才有意义；\n目标较小的场景（远处的人/车）降低分辨率反而更容易被识别", "Each tile is far smaller than this in grid mode; a higher value only helps when you zoom in.\nFor small targets (distant people or cars) a LOWER resolution actually detects better"),
@@ -691,9 +689,7 @@ const PAIRS: &[(&str, &str)] = &[
     ("智能识别", "Smart detection"),
     ("计算设备", "Compute device"),
     ("检测频率", "Detection rate"),
-    ("（CPU 固定 1 FPS）", "(CPU is fixed at 1 FPS)"),
     ("夜视优化（夜间识别不到目标时开启）", "Night vision boost (enable if targets are missed at night)"),
-    ("静止物体豁免", "Static-object grace"),
     ("关闭", "Off"),
     ("30 秒", "30 s"),
     ("1 分钟", "1 min"),
@@ -798,7 +794,6 @@ const PAIRS: &[(&str, &str)] = &[
     ("系统 CPU", "System CPU"),
     ("主程序", "Main process"),
     ("软件合计", "App total"),
-    ("通道", "Channel"),
     ("状态", "State"),
     ("抖动", "Jitter"),
     ("解码CPU / 合成", "Decode CPU / Compose"),
@@ -857,6 +852,122 @@ const PAIRS: &[(&str, &str)] = &[
     ("数据栏", "Data bar"),
     ("网络速率", "Network rate"),
     ("内存占用", "Memory usage"),
+    ("本机", "This machine"),
+    ("可用显卡", "Usable GPU"),
+    ("按处理器估算", "Estimated on CPU"),
+    ("推荐", "Recommended"),
+    ("本机预估", "estimated here"),
+    ("4 路约", "~4 channels"),
+    ("这个模型采用 AGPL-3.0，启用前需要先阅读须知", "This model is AGPL-3.0 — read the notice before enabling"),
+    ("阅读许可须知", "Read the licence notice"),
+    ("手动下载", "Download manually"),
+    ("下载完成", "Download complete"),
+    ("打开文件夹", "Open folder"),
+    ("下载", "Download"),
+    ("下载失败可手动放到：", "If the download fails, put the file in:"),
+    ("文件名必须是：", "The file must be named:"),
+    ("来源", "Source"),
+    ("来源：", "Source: "),
+    ("备用源", "fallback"),
+    ("已配置", "configured"),
+    ("无", "none"),
+    ("需要先同意该模型的许可才能启用", "Accept the licence for this model before enabling"),
+    ("使用第三方识别模型", "Third-party detection model"),
+    ("模型：", "Model: "),
+    ("许可证：", "Licence: "),
+    ("该模型不属于本程序：我们不打包、不镜像、也不随软件分发它", "This model is not part of this app: we do not bundle it, mirror it or ship it"),
+    ("下载地址指向模型作者与官方发布页，由你本人发起下载", "The download goes to the author's official release page and is started by you"),
+    ("AGPL-3.0 要求：分发基于该模型的衍生作品时需以 AGPL-3.0 开源", "AGPL-3.0 requires that derivative works you distribute are released under AGPL-3.0"),
+    ("将本模型用于闭源商业产品或服务，需向模型作者购买商业授权", "Using this model in a closed-source commercial product or service needs a commercial licence from the author"),
+    ("个人使用、学习研究、内部自用不受影响，可随时在设置里删除", "Personal, research and internal use are unaffected; you can delete it at any time"),
+    ("下载后会校验 SHA-256，文件被篡改或不完整都会被拒绝。", "The download is verified against a SHA-256 digest; tampered or truncated files are rejected."),
+    ("我已阅读并理解上述许可条款", "I have read and understood the licence terms above"),
+    ("同意并下载", "Agree and download"),
+    ("查看许可证", "View licence"),
+    ("模型输出维度不支持", "Unsupported model output shape"),
+    ("自定义镜像", "Custom mirror"),
+    ("官方源", "Official source"),
+    ("备用代理", "Fallback proxy"),
+    ("没有可用的下载源", "No usable download source"),
+    ("录像方式", "Recording mode"),
+    ("7×24 连续录制", "24/7 continuous"),
+    ("事件录制（识别到人/车才存盘）", "On event (save only when a person or vehicle is detected)"),
+    ("一直在录，超出容量上限后删最旧的。占空间，但不会漏任何画面", "Always recording; the oldest files are removed once the cap is reached. Uses space, misses nothing"),
+    ("常连相机但不写盘：画面只在内存里留几秒，识别到目标才把前后几秒存成片段。\n省硬盘、护盘，依赖智能识别", "Stays connected but writes nothing: the last few seconds live in memory and are only saved when a target appears. Saves disk wear and space; depends on detection"),
+    ("触发后继续录", "Keep recording for"),
+    ("内存缓冲", "Memory buffer"),
+    ("缓冲这几秒只占内存（每路约数 MB），不写盘；实际片段起点会对齐到关键帧，可能多几秒", "The buffered seconds stay in RAM (a few MB per channel) and never touch the disk; clips start on a keyframe, so they may run a little longer"),
+    ("事件录制模式下由识别自动开关，不需要手动点", "In event mode recording is driven by detection, no manual toggle needed"),
+    ("事件片段开始录制", "Event clip started"),
+    ("事件片段已保存", "Event clip saved"),
+    ("无法创建录像文件", "Cannot create the recording file"),
+    ("启动取流进程失败", "Failed to start the stream process"),
+    ("等待取流超时", "Timed out waiting for the stream"),
+    ("取流停顿，正在重连", "Stream stalled, reconnecting"),
+    ("取流进程已退出", "Stream process exited"),
+    ("事件录制依赖智能识别：请先到「实验」页启用识别",
+     "Event recording depends on detection: enable it on the Experiments tab first"),
+    ("事件录制依赖智能识别：请先到「实验」页下载模型并同意许可",
+     "Event recording depends on detection: download a model and accept its licence on the Experiments tab first"),
+    ("当前配置是事件录制，但识别不可用，因此不会录制任何画面",
+     "Event recording is configured but detection is unavailable, so nothing will be recorded"),
+    ("识别不可用，已切回 7×24 连续录制",
+     "Detection unavailable — switched back to 24/7 continuous recording"),
+    ("频率越高框越跟手，但更吃显卡；上限 25（多数相机只有 12–25 帧/秒，再高也是重复帧）",
+     "Higher rates track motion more smoothly but cost GPU time; 25 is the ceiling (most cameras emit 12–25 fps, beyond that frames repeat)"),
+    ("CPU 每帧都要占一个核的时间片，上限 10；老机器建议 2–3",
+     "On CPU each frame takes a slice of a core; the ceiling is 10, and 2–3 is sensible on older machines"),
+    ("按这个频率跑不满 4 路，画面会丢帧；建议降低频率或换更小的模型",
+     "At this rate four channels cannot keep up and frames will be dropped; lower the rate or pick a smaller model"),
+    ("相邻片段合并", "Merge clips closer than"),
+    ("同一路两段间隔小于这个值时拼成一个文件，避免遮挡、走走停停切出一堆碎片；0 = 不合并",
+     "Two clips on the same channel closer than this are joined into one file, so occlusions and stop-and-go targets don't shatter the timeline; 0 disables merging"),
+    ("事件片段已保存（并入上一段）", "Event clip saved (joined to the previous one)"),
+    ("全天录像", "Continuous"),
+    ("事件片段", "Event clips"),
+    ("全天目录", "Open continuous folder"),
+    ("事件目录", "Open events folder"),
+    ("整点分段的连续录制文件", "Hourly segmented continuous recordings"),
+    ("识别到人/车才存下来的短片", "Short clips saved only when a person or vehicle shows up"),
+    ("今日事件", "Today's events"),
+    ("看今天录了多久、哪些时段有人或车经过", "See how much was recorded today and when something moved"),
+    ("今日报告", "Today's report"),
+    ("今天没有录像", "No recording today"),
+    ("今天还没有检测到人/车", "No person or vehicle detected today"),
+    ("进行中", "in progress"),
+    ("中断", "interrupted"),
+    ("正在录制的通道", "Recording now:"),
+    ("报告根据日志生成，日志每天一个文件", "Built from the log, one file per day"),
+    ("通道", "Channel"),
+    ("开始", "Start"),
+    ("结束", "End"),
+    ("时长", "Duration"),
+    ("检出", "Detected"),
+    ("开始事件录像", "started event recording"),
+    ("设置已更改", "Settings changed"),
+    ("画面已恢复", "Picture restored"),
+    ("正在重新连接", "Reconnecting"),
+    ("同意并启用", "Agree and enable"),
+    ("已同意许可，模型已在本机，可以直接启用",
+     "Licence accepted — the model is already on this machine and can be enabled right away"),
+    ("已在主界面开启识别", "Detection turned on from the main window"),
+    ("已在主界面关闭识别", "Detection turned off from the main window"),
+    ("启动时自动开启识别", "Detection resumed on startup"),
+    ("识别未自动开启（模型或许可不可用）",
+     "Detection not resumed (model or licence unavailable)"),
+    ("单段最长", "Max clip length"),
+    ("到点强行收尾，等目标离开画面才恢复录制；防止一辆一直停着的车把事件录像变成 24 小时录制。0 = 不限",
+     "Force a cut at this length and wait for the target to leave before recording again, so a parked car cannot turn event recording into 24/7 capture. 0 = unlimited"),
+    ("单段已达上限，暂停直到目标离开", "Clip hit the length cap, paused until the target leaves"),
+    ("事件录像已接入", "Event recording connected"),
+    ("事件录像接入失败（端口或线程）", "Event recording could not start (port or thread)"),
+    ("事件录像取流失败", "Event recording stream failed"),
+    ("未接入：识别未开启", "Not connected: detection is off"),
+    ("未接入：ffmpeg 未就绪", "Not connected: ffmpeg not ready"),
+    ("连接未能建立", "connection could not be established"),
+    ("「CPU 单核」指处理器的一个逻辑核，和显卡的 CUDA 核心无关；显卡模式下 CPU 只做预处理，单帧约 2 ms",
+     "\"One CPU core\" means one logical CPU thread — nothing to do with CUDA cores. On GPU the CPU only does preprocessing, about 2 ms per frame"),
+    ("速度", "speed"),
     ("启动与运行", "Startup & runtime"),
     ("开机自启", "Start with Windows"),
     ("进程守护", "Process watchdog"),
@@ -897,7 +1008,6 @@ const PAIRS: &[(&str, &str)] = &[
     ("Direct3D 11（通用）", "Direct3D 11 (generic)"),
     ("DXVA2（旧）", "DXVA2 (legacy)"),
     ("其他", "Other"),
-    ("自定义镜像", "Custom mirror"),
     ("npmmirror（国内）", "npmmirror (China)"),
     ("无法执行", "Cannot run"),
     ("ffmpeg 返回非零退出码", "ffmpeg exited with a non-zero code"),
@@ -907,7 +1017,6 @@ const PAIRS: &[(&str, &str)] = &[
     ("准备中", "Preparing"),
     ("找不到可写的安装目录", "No writable install folder"),
     ("创建目录失败", "Cannot create the folder"),
-    ("没有可用的下载源", "No usable download source"),
     ("保存失败", "Save failed"),
     ("下载到的文件不可用", "The downloaded file is unusable"),
     ("切换备用源…", "Switching to a backup mirror…"),

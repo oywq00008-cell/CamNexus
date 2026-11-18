@@ -20,3 +20,9 @@
 
 # 用户下载的原始素材目录（已归档到 assets/）
 /喇叭
+
+# 本机测试包（含 ffmpeg.exe、DirectML.dll、带凭据的 config.json，共 135 MB）
+/testkit
+
+# 本机凭据，不要提交
+/.secrets

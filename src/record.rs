@@ -491,6 +491,14 @@ impl RecordManager {
 }
 
 /// 存档根目录：配置为空时用 `用户目录\Videos\CamNexus`
+/// 事件片段的根目录。
+///
+/// 与全天录像**分开存放**：全天是整点分段的连续文件，事件是零散短片，
+/// 混在一个文件夹里既难找也容易误删。
+pub fn events_root(cfg: &AppConfig) -> PathBuf {
+    record_root(cfg).join("事件片段")
+}
+
 pub fn record_root(cfg: &AppConfig) -> PathBuf {
     let raw = cfg.record_dir.trim();
     if !raw.is_empty() {
@@ -770,6 +778,14 @@ fn walk_files(root: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
         };
         for e in rd.flatten() {
             let p = e.path();
+            // 以点开头的是正在写的临时文件（合并用的 .merge.tmp.mp4），
+            // 容量清理绝不能把它们算进去，否则会在合并途中把文件删掉
+            if p.file_name()
+                .map(|n| n.to_string_lossy().starts_with('.'))
+                .unwrap_or(false)
+            {
+                continue;
+            }
             if p.is_dir() {
                 stack.push(p);
             } else if p
@@ -874,6 +890,52 @@ pub fn dates_for(root: &Path, channels: &[Channel], idx: usize) -> Vec<String> {
     v.sort();
     v.reverse();
     v
+}
+
+
+/// 某天某通道的录制量：（文件数, 总秒数）。
+///
+/// 全天录像的文件名里带着起止时间（`... 15-00_16-00.mp4`），直接算即可，
+/// 不用起 ffmpeg 去读时长。
+pub fn day_totals(root: &Path, channels: &[Channel], idx: usize, day: &str) -> (u32, u64) {
+    let dir = root.join(day).join(channel_folder(channels, idx));
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return (0, 0);
+    };
+    let mut files = 0u32;
+    let mut secs = 0u64;
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".mp4") {
+            continue;
+        }
+        files += 1;
+        secs += span_of_name(&name).unwrap_or(0);
+    }
+    (files, secs)
+}
+
+/// 从 `2026-11-18 15-00_16-00.mp4` 里解析出时长（秒）。解析不出返回 None。
+fn span_of_name(name: &str) -> Option<u64> {
+    let stem = name.strip_suffix(".mp4")?;
+    let range = stem.split(' ').nth(1)?;
+    let (a, b) = range.split_once('_')?;
+    let start = hhmm(a)?;
+    let end = hhmm(b)?;
+    // 跨零点按 24 小时补一圈
+    let dur = if end >= start {
+        end - start
+    } else {
+        end + 24 * 3600 - start
+    };
+    Some(dur)
+}
+
+fn hhmm(s: &str) -> Option<u64> {
+    let (h, m) = s.split_once('-')?;
+    let h: u64 = h.parse().ok()?;
+    let m: u64 = m.parse().ok()?;
+    (h < 24 && m < 60).then_some(h * 3600 + m * 60)
 }
 
 /// 目录里有没有 mp4
@@ -987,7 +1049,7 @@ mod tests {
     #[test]
     fn segment_ends_on_the_hour() {
         let (secs, end) = segment_plan();
-        assert!(secs >= 60 && secs <= 3600, "分段时长应在 1 分钟到 1 小时之间");
+        assert!((60..=3600).contains(&secs), "分段时长应在 1 分钟到 1 小时之间");
         // 结束时间的分钟位必须是整点（除非走了 3600 的兜底分支）
         if secs != 3600 {
             assert_eq!(&end[3..], "00", "应对齐整点，实际 {end}");
@@ -1015,5 +1077,15 @@ mod tests {
         let cfg = AppConfig::default();
         let root = record_root(&cfg);
         assert!(root.ends_with("CamNexus"));
+    }
+
+    #[test]
+    fn name_span_is_parsed() {
+        assert_eq!(span_of_name("2026-11-18 15-00_16-00.mp4"), Some(3600));
+        assert_eq!(span_of_name("2026-11-18 23-30_00-30.mp4"), Some(3600), "跨零点");
+        assert_eq!(span_of_name("2026-11-18 15-00_15-45.mp4"), Some(2700));
+        // 事件片段只有开始时间，算不出来
+        assert_eq!(span_of_name("2026-11-18 16-44-31.mp4"), None);
+        assert_eq!(span_of_name("乱命名.mp4"), None);
     }
 }

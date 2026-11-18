@@ -5,6 +5,7 @@ mod config;
 mod detect;
 mod diag;
 mod discover;
+mod eventrec;
 mod fetch;
 mod fonts;
 mod i18n;
@@ -47,6 +48,20 @@ fn main() -> eframe::Result<()> {
     i18n::set_lang(cfg.lang);
 
     // --detect-test <图片>：用 ffmpeg 解码后跑一次检测，打印结果（自检用）
+    // --event-test N：对第 N 路（1 起）手动触发一次事件录像，验证取流→缓冲→落盘→重封装
+    if let Some(i) = args.iter().position(|a| a == "--event-test")
+        && let Some(n) = args.get(i + 1).and_then(|s| s.parse::<usize>().ok())
+    {
+        event_test(n, &cfg);
+        return Ok(());
+    }
+
+    // --hw-test：打印本机硬件画像与模型推荐，远程排查用
+    if args.iter().any(|a| a == "--hw-test") {
+        hw_test();
+        return Ok(());
+    }
+
     // --net-test：打印各网卡 2 秒内的收发速率，用于核对数据栏的读数
     if args.iter().any(|a| a == "--net-test") {
         net_test();
@@ -353,6 +368,143 @@ fn guard_loop() -> ! {
     }
 }
 
+
+
+/// 事件录像自检：起一路 tap，等缓冲攒满，手动触发一次，看是否真的落出片段。
+fn event_test(n: usize, cfg: &config::AppConfig) {
+    let args: Vec<String> = std::env::args().collect();
+    let idx = n.saturating_sub(1);
+    let Some(ch) = cfg.channels.get(idx) else {
+        eprintln!("没有第 {n} 路通道");
+        return;
+    };
+    let Some(ff) = config::find_ffmpeg(&cfg.ffmpeg_path) else {
+        eprintln!("未找到 ffmpeg");
+        return;
+    };
+    // 事件片段写在独立目录，和全天录像分开
+    let root = record::events_root(cfg);
+    let pre = cfg.event_pre_secs.clamp(2, 30);
+    println!(
+        "通道 {} · 缓冲 {} 秒 · 目录 {}",
+        ch.name,
+        pre,
+        root.display()
+    );
+
+    let Some(tap) = eventrec::start(eventrec::TapSpec {
+        ffmpeg: ff,
+        url: ch.rtsp(),
+        channel: ch.name.clone(),
+        root: root.clone(),
+        tcp: cfg.tcp,
+        pre_secs: pre,
+        merge_gap: std::time::Duration::from_secs(cfg.event_merge_gap_secs as u64),
+        max_clip: std::time::Duration::from_secs(cfg.event_max_clip_secs as u64),
+        start_delay: std::time::Duration::ZERO,
+    }) else {
+        eprintln!("起 tap 失败（端口或线程）");
+        return;
+    };
+
+    // 等缓冲攒起来（最多 20 秒）
+    for _ in 0..40 {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let st = tap.status();
+        if st.buffered_secs >= pre as f32 * 0.6 {
+            break;
+        }
+    }
+    let st = tap.status();
+    println!("缓冲就绪：{:.1} 秒，状态 {:?}", st.buffered_secs, st.state);
+
+    // --times N：连续触发 N 次，用来验证「相邻片段合并」
+    let times = args
+        .iter()
+        .position(|a| a == "--times")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(1)
+        .clamp(1, 5);
+
+    let post = std::time::Duration::from_secs(cfg.event_post_secs.clamp(1, 60) as u64);
+    for round in 1..=times {
+        tap.trigger(post);
+        println!("第 {round} 次触发，等待 {} 秒收尾…", post.as_secs() + 3);
+        std::thread::sleep(post + std::time::Duration::from_secs(4));
+    }
+
+    let st = tap.status();
+    println!("结束：片段 {} 个，错误 {:?}", st.clips, st.last_error);
+    drop(tap);
+    std::thread::sleep(std::time::Duration::from_secs(2)); // 等重封装
+    let today = {
+        let (y, mo, d, ..) = sys::local_now();
+        format!("{y:04}-{mo:02}-{d:02}")
+    };
+    let dir = root.join(&today).join(&ch.name);
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let name = p.file_name().unwrap_or_default().to_string_lossy().to_string();
+            if name.contains(".part.") || name.ends_with(".mp4") || name.ends_with(".ts") {
+                let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                println!("  {name}  {:.1} MB", len as f64 / 1_048_576.0);
+            }
+        }
+    }
+}
+
+/// 打印硬件画像与推荐结果。远程机器没法截图，用它核对推荐逻辑。
+fn hw_test() {
+    let hw = sys::hardware();
+    println!("处理器    {}", hw.cpu);
+    println!("核数      {}（逻辑）", hw.cores);
+    println!("估分      {}（Cinebench R23 多核，估算）", hw.cpu_mt);
+    println!("显卡      {}", if hw.gpu.is_empty() { "（未识别）" } else { &hw.gpu });
+    println!(
+        "TFLOPS    {}",
+        if hw.gpu_tflops > 0.0 {
+            format!("{:.2}", hw.gpu_tflops)
+        } else {
+            "—（核显或未知型号）".to_string()
+        }
+    );
+    println!("DirectML  {}", if hw.directml { "可用" } else { "不可用" });
+    println!(
+        "可用显卡  {}",
+        if hw.gpu_usable() { "是" } else { "否（按 CPU 估算）" }
+    );
+
+    let rec = model::recommend(hw);
+    println!();
+    println!("推荐      {}（{}）", rec.name, rec.license.label());
+    println!();
+    println!("各档预估（单帧 / 4 路）：");
+    for m in model::MODELS {
+        let t = model::estimate_ms(m, hw);
+        let mark = if m.id == rec.id { " ←推荐" } else { "" };
+        println!(
+            "  {:<9} {:>6.1} ms  {:>7.0} ms{}",
+            m.name,
+            t,
+            t * 4.0,
+            mark
+        );
+    }
+    println!();
+    let dir = model::models_dir().map(|d| d.display().to_string()).unwrap_or_default();
+    println!("模型目录  {dir}");
+    for m in model::MODELS {
+        let installed = model::installed_of(m).is_some();
+        println!(
+            "  {:<9} {}",
+            m.name,
+            if installed { "已安装" } else { "未下载" }
+        );
+    }
+}
+
 /// 自检：把每个网络接口的实际速率打出来，用来核对数据栏读数。
 fn net_test() {
     use std::time::Duration;
@@ -408,6 +560,7 @@ fn audio_test(idx1: usize) {
 
     let stream = stream::Stream::spawn(stream::StreamCfg {
         url: ch.display_rtsp(),
+        name: ch.name.clone(),
         ffmpeg: ff,
         width: cfg.render_width,
         height: cfg.render_height,
@@ -467,6 +620,29 @@ fn detect_test(image: &str, gpu: bool, night: bool) {
         return;
     }
 
+    // --model <路径> 指定任意 ONNX；--input <边长> 覆盖默认输入尺寸
+    let model_arg = std::env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|w| w[0] == "--model")
+        .map(|w| w[1].clone());
+    let input_arg = std::env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|w| w[0] == "--input")
+        .and_then(|w| w[1].parse::<usize>().ok())
+        .unwrap_or(640);
+
+    if let Some(m) = &model_arg {
+        let path = std::path::PathBuf::from(m);
+        if !path.exists() {
+            eprintln!("模型不存在：{m}");
+            return;
+        }
+        run_detect(&path, input_arg, &out.stdout, w, h, gpu, night);
+        return;
+    }
+
     let (path, size) = match detect::find_model("yolox_s.onnx") {
         Some(p) => (p, 640usize),
         None => match detect::find_model("yolox_tiny.onnx") {
@@ -477,48 +653,97 @@ fn detect_test(image: &str, gpu: bool, night: bool) {
             }
         },
     };
+    run_detect(&path, size, &out.stdout, w, h, gpu, night);
+}
+
+/// 加载模型、跑一次或多次（`--bench N` 用来测稳态耗时）、打印结果。
+fn run_detect(
+    path: &std::path::Path,
+    size: usize,
+    rgb: &[u8],
+    w: usize,
+    h: usize,
+    gpu: bool,
+    night: bool,
+) {
+    let bench = std::env::args()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .find(|a| a[0] == "--bench")
+        .and_then(|a| a[1].parse::<usize>().ok())
+        .unwrap_or(1)
+        .max(1);
+
     let t0 = std::time::Instant::now();
-    match detect::Detector::load_with(&path, size, gpu) {
-        Ok(mut d) => {
-            let load_ms = t0.elapsed().as_millis();
-            d.set_night_opt(night);
-            let t1 = std::time::Instant::now();
-            match d.detect(&out.stdout, w, h, 0.35) {
-                Ok(v) => {
-                    println!(
-                        "模型 {}（{}×{}，{}）  加载 {} ms  推理 {} ms  画面 {}x{}",
-                        path.file_name().unwrap_or_default().to_string_lossy(),
-                        size,
-                        size,
-                        match (gpu, night) {
-                            (false, false) => "CPU",
-                            (false, true) => "CPU + 夜视优化",
-                            (true, false) => "显卡 DirectML",
-                            (true, true) => "显卡 DirectML + 夜视优化",
-                        },
-                        load_ms,
-                        t1.elapsed().as_millis(),
-                        w,
-                        h
-                    );
-                    if v.is_empty() {
-                        println!("未检测到人体/车辆");
-                    }
-                    for det in v {
-                        println!(
-                            "  {:<6} {:3.0}%  位置 {:.2},{:.2}  尺寸 {:.2}x{:.2}",
-                            det.label,
-                            det.score * 100.0,
-                            det.x,
-                            det.y,
-                            det.w,
-                            det.h
-                        );
-                    }
-                }
-                Err(e) => eprintln!("推理失败：{e}"),
+    let mut d = match detect::Detector::load_with(path, size, gpu) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("加载失败：{e}");
+            return;
+        }
+    };
+    let load_ms = t0.elapsed().as_millis();
+    d.set_night_opt(night);
+
+    let mut times = Vec::with_capacity(bench);
+    let mut last = Vec::new();
+    for _ in 0..bench {
+        let t = std::time::Instant::now();
+        match d.detect(rgb, w, h, 0.35) {
+            Ok(v) => {
+                times.push(t.elapsed().as_secs_f64() * 1000.0);
+                last = v;
+            }
+            Err(e) => {
+                eprintln!("推理失败：{e}");
+                return;
             }
         }
-        Err(e) => eprintln!("加载失败：{e}"),
+    }
+
+    let avg: f64 = times.iter().sum::<f64>() / times.len() as f64;
+    let min = times.iter().cloned().fold(f64::MAX, f64::min);
+    let max = times.iter().cloned().fold(0.0, f64::max);
+    println!(
+        "模型 {}（{}×{}，{}）  加载 {} ms  画面 {}x{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        size,
+        size,
+        match (gpu, night) {
+            (false, false) => "CPU",
+            (false, true) => "CPU + 夜视优化",
+            (true, false) => "显卡 DirectML",
+            (true, true) => "显卡 DirectML + 夜视优化",
+        },
+        load_ms,
+        w,
+        h
+    );
+    if bench > 1 {
+        println!(
+            "  {} 次：平均 {:.0} ms  最快 {:.0}  最慢 {:.0}  → 4 路 1FPS {}",
+            bench,
+            avg,
+            min,
+            max,
+            if avg * 4.0 <= 1000.0 { "可行" } else { "跟不上" }
+        );
+    } else {
+        println!("  推理 {:.0} ms", avg);
+    }
+
+    if last.is_empty() {
+        println!("未检测到人体/车辆");
+    }
+    for det in last {
+        println!(
+            "  {:<6} {:3.0}%  位置 {:.2},{:.2}  尺寸 {:.2}x{:.2}",
+            det.label,
+            det.score * 100.0,
+            det.x,
+            det.y,
+            det.w,
+            det.h
+        );
     }
 }

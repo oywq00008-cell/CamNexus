@@ -99,41 +99,69 @@ pub enum DetectDevice {
 }
 
 /// 智能识别设置
-#[derive(Clone, Copy, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(default)]
 pub struct DetectCfg {
     pub device: DetectDevice,
-    /// 检测频率（仅显卡模式生效；CPU 固定 1）
+    /// 检测频率。CPU 上限 10、显卡上限 25，实际用 `effective_fps()` 取夹紧后的值
     pub fps: u32,
     /// 夜视优化：CLAHE 对比度增强
     pub night_opt: bool,
-    /// 静止物体豁免秒数，0 = 不豁免
-    pub static_grace_secs: u32,
     /// 实验功能：用户是否在设置里启用了识别。
     /// 关着的时候主界面不出现识别按钮，整个识别链路也不启动。
     #[serde(default)]
     pub enabled: bool,
+    /// 选中的模型 id（见 `model::MODELS`）
+    #[serde(default = "default_model")]
+    pub model: String,
+    /// 已阅读并同意许可的模型 id。
+    /// AGPL 的模型必须出现在这里，否则不允许下载、也不允许启用识别。
+    #[serde(default)]
+    pub accepted: Vec<String>,
+    /// 上次退出时识别是开着的。
+    ///
+    /// 与 `enabled` 分开：`enabled` 是「这个功能能不能用」（设置里的实验开关），
+    /// `running` 是「现在开着没有」。崩溃后守护进程把程序拉起来时靠它恢复，
+    /// 否则事件录像会因为识别没开而彻底失效。
+    #[serde(default = "default_true")]
+    pub running: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_model() -> String {
+    "yolo26n".to_string()
 }
 
 impl Default for DetectCfg {
     fn default() -> Self {
         Self {
             device: DetectDevice::Cpu,
-            fps: 1,
+            fps: 3,
             night_opt: false,
-            static_grace_secs: 60,
             enabled: false,
+            model: default_model(),
+            accepted: Vec::new(),
+            running: true,
         }
     }
 }
 
 impl DetectCfg {
     /// 实际生效的检测频率
-    pub fn effective_fps(&self) -> u32 {
+    /// CPU 与显卡的上限不同：CPU 上每帧都要占一个核的时间片，
+    /// 显卡是异步提交，能压得更密。上限只是护栏，实际能跑多少由模型决定。
+    pub fn max_fps(&self) -> u32 {
         match self.device {
-            DetectDevice::Cpu => 1,
-            DetectDevice::Gpu => self.fps.clamp(1, 5),
+            DetectDevice::Cpu => 10,
+            DetectDevice::Gpu => 25,
         }
+    }
+
+    pub fn effective_fps(&self) -> u32 {
+        self.fps.clamp(1, self.max_fps())
     }
 }
 
@@ -324,7 +352,62 @@ pub struct AppConfig {
     /// 进程守护：崩溃后由守护进程自动拉起
     pub guard: bool,
     /// 启动软件后自动开始录像（只在摄像机在线时才真正开录）
+    #[serde(default)]
     pub auto_record: bool,
+    /// 录像方式：7×24 连续录，还是只在检测到人/车时存盘
+    #[serde(default = "default_record_mode")]
+    pub record_mode: RecordMode,
+    /// 事件录像：触发前保留多少秒（内存缓冲，不落盘）
+    #[serde(default = "default_event_pre")]
+    pub event_pre_secs: u32,
+    /// 事件录像：目标消失后继续录多少秒
+    #[serde(default = "default_event_post")]
+    pub event_post_secs: u32,
+    /// 事件录像：多少置信度以上才算触发（比画框门槛高，压误报）
+    #[serde(default = "default_event_conf")]
+    pub event_conf: f32,
+    /// 事件录像：同一路两段间隔小于这个秒数就合并成一个文件；0 = 不合并
+    #[serde(default = "default_merge_gap")]
+    pub event_merge_gap_secs: u32,
+    /// 事件录像：单段最长多少秒，到点强制收尾并等目标离开再恢复；0 = 不限
+    ///
+    /// 没有这个上限，一辆一直停在画面里的车会被持续检出、一直录下去，
+    /// 事件录像就退化成了 24 小时录制。
+    #[serde(default = "default_max_clip")]
+    pub event_max_clip_secs: u32,
+}
+
+fn default_merge_gap() -> u32 {
+    30
+}
+
+fn default_max_clip() -> u32 {
+    600
+}
+
+fn default_event_conf() -> f32 {
+    0.45
+}
+
+fn default_record_mode() -> RecordMode {
+    RecordMode::Continuous
+}
+fn default_event_pre() -> u32 {
+    5
+}
+fn default_event_post() -> u32 {
+    5
+}
+
+/// 录像方式
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordMode {
+    /// 7×24 连续录制（原有行为）
+    #[default]
+    Continuous,
+    /// 事件录制：常连但只在检测到目标时落盘
+    Event,
 }
 
 /// 新手引导状态
@@ -366,6 +449,12 @@ impl Default for AppConfig {
             autostart: false,
             guard: false,
             auto_record: false,
+            record_mode: RecordMode::Continuous,
+            event_pre_secs: 5,
+            event_post_secs: 5,
+            event_conf: 0.45,
+            event_merge_gap_secs: 30,
+            event_max_clip_secs: 600,
         }
     }
 }
@@ -580,30 +669,36 @@ mod tests {
         assert_eq!(c.rtsp(), "rtsp://192.168.1.10:554/live");
     }
 
-    /// CPU 恒为 1 FPS；显卡模式只允许 1–5 的整数，越界一律夹回
+    /// 帧率：CPU 上限 10、显卡上限 25，越界一律夹回
     #[test]
-    fn detect_fps_is_one_to_five_integers() {
+    fn detect_fps_is_clamped_per_device() {
         let mut c = DetectCfg {
             device: DetectDevice::Cpu,
-            fps: 5,
+            fps: 6,
             ..Default::default()
         };
-        assert_eq!(c.effective_fps(), 1, "CPU 模式必须固定 1 FPS");
+        assert_eq!(c.max_fps(), 10);
+        assert_eq!(c.effective_fps(), 6, "CPU 模式允许高于 1 FPS");
+        for (input, want) in [(0, 1), (1, 1), (10, 10), (11, 10), (99, 10)] {
+            c.fps = input;
+            assert_eq!(c.effective_fps(), want, "CPU fps={input} 应夹到 {want}");
+        }
 
         c.device = DetectDevice::Gpu;
-        for (input, want) in [(1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (0, 1), (9, 5)] {
+        assert_eq!(c.max_fps(), 25);
+        for (input, want) in [(1, 1), (8, 8), (25, 25), (26, 25), (100, 25)] {
             c.fps = input;
-            assert_eq!(c.effective_fps(), want, "fps={input} 应夹到 {want}");
+            assert_eq!(c.effective_fps(), want, "显卡 fps={input} 应夹到 {want}");
         }
     }
 
-    /// 老配置文件没有 detect 字段时，要落回 CPU / 1 FPS / 不增强 / 1 分钟豁免
+    /// 老配置文件没有 detect 字段时，要落回默认值
     #[test]
     fn old_config_without_detect_falls_back() {
         let cfg: AppConfig = serde_json::from_str(r#"{"channels":[],"dark":true}"#).unwrap();
         assert_eq!(cfg.detect.device, DetectDevice::Cpu);
-        assert_eq!(cfg.detect.effective_fps(), 1);
+        assert_eq!(cfg.detect.effective_fps(), 3, "默认帧率");
         assert!(!cfg.detect.night_opt);
-        assert_eq!(cfg.detect.static_grace_secs, 60);
+        assert!(!cfg.detect.enabled);
     }
 }
