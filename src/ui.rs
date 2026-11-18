@@ -4123,34 +4123,33 @@ impl CamNexusApp {
             let Some(tap) = self.event_taps[i].as_ref() else {
                 continue;
             };
-            // 看原始检测，不看画框：画框只标运动的，触发要看「存在」。
+            // 判据只有一条：**画面里有没有东西在动**。
             //
-            // 进出用迟滞判断：分数在阈值上下抖是常态，只用「≥ 阈值」当边沿
-            // 会一秒写好几条日志、并把触发窗口撕成碎片。进入要 ≥ 阈值，
-            // 退出则要求「完全没有检测」。
-            // 触发条件（这才是「该不该录」的判据）：
-            //   ① 有目标在动 —— 跟踪器筛过的，停着的车/摩托不算
-            //   ② 画面里有「人」—— 站着不动的人和走动的同等重要，
-            //      否则一个人往门口一站，录完 5 秒就停了
+            // 不采「检出到人就录」：服装店的模特、墙上的人形海报、站岗不动的保安
+            // 都会被持续检出，那样就等于 24 小时录制。反过来，人走开、走动、
+            // 站起来，都会立刻触发——「有事」的本质就是动了。
             //
-            // 只看「有没有检出」是不行的：一辆停着的摩托会被持续检出，
-            // 那样事件录像就退化成 24 小时录制了。静止的车不算事件，
-            // 静止的人算——这是监控场景的常识。
-            let speed = self.detect.as_ref().map(|d| d.speed(i)).unwrap_or(0.0);
-            let moving = self
+            // 运动幅度取「中心位移」与「尺寸变化率」的较大值，
+            // 所以朝镜头走过来（中心几乎不动）也能算出来。
+            let seen = self
                 .detect
                 .as_ref()
-                .and_then(|d| d.moving(i))
-                .filter(|_| speed >= crate::detect::TRIGGER_SPEED);
-            let person = self
-                .detect
-                .as_ref()
-                .and_then(|d| d.raw_score(i))
-                .filter(|(label, score)| is_person(label) && *score >= conf);
+                .and_then(|d| d.motion(i))
+                .filter(|(_, _, m)| *m > 0.0)
+                .and_then(|(label, score, m)| {
+                    // 置信度门槛：用**这条轨迹自己的**分数，
+                    // 拿全帧最高分会串（画面里同时有车和人时）
+                    if score < conf {
+                        return None;
+                    }
+                    crate::eventrec::trigger_kind(is_person(label), m)
+                        .map(|k| (label, score, m, k))
+                });
+            let Some((label, score, m, kind)) = seen else {
+                continue;
+            };
+            tap.trigger(post, kind);
 
-            let seen = moving
-                .map(|(l, s)| (l, s.max(person.map(|(_, p)| p).unwrap_or(0.0))))
-                .or(person);
             let now = Instant::now();
             let held = self
                 .event_hot_until
@@ -4158,27 +4157,19 @@ impl CamNexusApp {
                 .and_then(|x| *x)
                 .map(|until| now < until)
                 .unwrap_or(false);
-            let hit = seen.is_some();
-
-            if hit {
-                tap.trigger(post);
-                if !held
-                    && let (Some((label, score)), Some(ch)) =
-                        (seen, self.cfg.channels.get(i))
-                {
-                    logs::append(
-                        &ch.name,
-                        &format!(
-                            "{} {label}（{score:.2}，{} {:.0}%/s）→ {}",
-                            tr("检出"),
-                            tr("速度"),
-                            speed * 100.0,
-                            tr("开始事件录像")
-                        ),
-                    );
-                }
+            if !held && let Some(ch) = self.cfg.channels.get(i) {
+                logs::append(
+                    &ch.name,
+                    &format!(
+                        "{} {label}（{score:.2}，{} {:.0}%/s）→ {}",
+                        tr("检出"),
+                        tr("速度"),
+                        m * 100.0,
+                        tr("开始事件录像")
+                    ),
+                );
             }
-            if hit && self.event_hot_until.len() > i {
+            if self.event_hot_until.len() > i {
                 // 同一个事件在触发窗口内只记一条
                 self.event_hot_until[i] = Some(now + post);
             }
@@ -6074,6 +6065,9 @@ mod sig_tests {
 /// 检测任务：通道下标 + 帧（Arc 共享，零拷贝）+ 尺寸
 type DetectJob = (usize, std::sync::Arc<Vec<u8>>, usize, usize);
 
+/// 检测线程回传的一帧结果：（通道号, 该送显的目标, 最"像在动"的目标 / 分数 / 幅度）
+type DetectOut = (usize, Vec<Detection>, Option<(&'static str, f32, f32)>);
+
 pub struct DetectRuntime {
     pub enabled: bool,
     pub cfg: crate::config::DetectCfg,
@@ -6081,7 +6075,7 @@ pub struct DetectRuntime {
     /// 模型加载失败的说明，界面取走后清空（用于弹一次提示）
     pub error: Option<String>,
     tx: std::sync::mpsc::SyncSender<DetectJob>,
-    rx: std::sync::mpsc::Receiver<(usize, Vec<Detection>, f32, &'static str, f32)>,
+    rx: std::sync::mpsc::Receiver<DetectOut>,
     /// 后台线程回报的错误（空串 = 加载成功）
     st_rx: std::sync::mpsc::Receiver<String>,
     /// 后台线程随时更新的状态文案
@@ -6091,9 +6085,9 @@ pub struct DetectRuntime {
     pub results: std::collections::HashMap<usize, (Vec<Detection>, Instant)>,
     /// 每路的「原始检测最高分」与时间戳。事件录制看这个，
     /// 不受画框的运动筛选影响。
-    raw_max: std::collections::HashMap<usize, (f32, &'static str, Instant)>,
     /// 每路最近一轮的最大运动速度（归一化宽度/秒）
-    speeds: std::collections::HashMap<usize, (f32, Instant)>,
+    /// 每路「最像在动」的目标：(类别, 幅度)。触发用它，静止目标幅度接近 0。
+    motions: std::collections::HashMap<usize, (&'static str, f32, f32, Instant)>,
 }
 
 impl DetectRuntime {
@@ -6103,7 +6097,7 @@ impl DetectRuntime {
         // 有界队列：一帧是整张原图（2560×1440 ≈ 11MB），多路高帧率下如果
         // 推理跟不上，无界 channel 会把内存吃掉；满了就丢帧，绝不阻塞 UI。
         let (tx, job_rx) = std::sync::mpsc::sync_channel::<DetectJob>(2);
-        let (res_tx, rx) = std::sync::mpsc::channel::<(usize, Vec<Detection>, f32, &'static str, f32)>();
+        let (res_tx, rx) = std::sync::mpsc::channel::<DetectOut>();
         let (st_tx, st_rx) = std::sync::mpsc::channel::<String>();
         let status_slot = std::sync::Arc::new(std::sync::Mutex::new(String::from(tr("正在加载模型…"))));
         let slot = status_slot.clone();
@@ -6156,20 +6150,9 @@ impl DetectRuntime {
                 let mut trackers = crate::detect::Trackers::new();
                 while let Ok((idx, data, w, h)) = job_rx.recv() {
                     if let Ok(raw) = det.detect(&data, w, h, 0.35) {
-                        // 原始检测的最高分：画框只标运动目标，但事件录制要看到
-                        // 「有人/车存在」——站着不动、被短暂遮挡后重新出现都算。
-                        let (raw_max, raw_label) = raw
-                            .iter()
-                            .fold((0.0f32, ""), |acc, d| {
-                                if d.score > acc.0 {
-                                    (d.score, d.label)
-                                } else {
-                                    acc
-                                }
-                            });
                         let shown = trackers.update(idx, &raw, std::time::Instant::now());
-                        let spd = trackers.speed(idx);
-                        let _ = res_tx.send((idx, shown, raw_max, raw_label, spd));
+                        let motion = trackers.motion(idx);
+                        let _ = res_tx.send((idx, shown, motion));
                         ctx.request_repaint();
                     }
                 }
@@ -6187,20 +6170,19 @@ impl DetectRuntime {
             status_slot,
             last_sent: std::collections::HashMap::new(),
             results: std::collections::HashMap::new(),
-            raw_max: std::collections::HashMap::new(),
-            speeds: std::collections::HashMap::new(),
+            motions: std::collections::HashMap::new(),
         }
     }
 
     /// 每帧收结果 + 刷新状态
     pub fn poll(&mut self) {
-        while let Ok((idx, dets, raw_max, raw_label, spd)) = self.rx.try_recv() {
+        while let Ok((idx, dets, motion)) = self.rx.try_recv() {
             self.results.insert(idx, (dets, Instant::now()));
-            self.raw_max.insert(idx, (raw_max, raw_label, Instant::now()));
-            // 速度是每 400ms 结算一次，其余轮次是 0；只写非零值，
-            // 让「刚才在动」这个判断保持 2 秒，否则迟滞会被打断
-            if spd > 0.0 {
-                self.speeds.insert(idx, (spd, Instant::now()));
+            // 运动幅度同理：只在结算出非零值时覆盖，保留 2 秒的「刚才在动」
+            if let Some((label, score, m)) = motion
+                && m > 0.0
+            {
+                self.motions.insert(idx, (label, score, m, Instant::now()));
             }
         }
         // 加载是异步的：状态文案每帧同步一次，否则会永远停在「正在加载模型…」
@@ -6243,35 +6225,13 @@ impl DetectRuntime {
     }
 
     /// 某一路当前有效的检测结果（3 秒内）
-    /// 这一路最近是否检出过达到阈值的目标（不看运动筛选）。
-    /// 事件录制的触发用它：站着不动的人、被遮挡后重新出现的目标都能立刻续上。
-    /// 运动目标里分数最高的一条。这些是**跟踪器筛过**的目标，
-    /// 停着不动的车不会出现在这里。
-    pub fn moving(&self, idx: usize) -> Option<(&'static str, f32)> {
-        let (dets, at) = self.results.get(&idx)?;
-        if at.elapsed() >= std::time::Duration::from_secs(2) {
-            return None;
-        }
-        dets.iter()
-            .max_by(|a, b| a.score.total_cmp(&b.score))
-            .map(|d| (d.label, d.score))
-    }
-
-    /// 该通道最近一轮的最大运动速度（归一化宽度/秒）
-    pub fn speed(&self, idx: usize) -> f32 {
-        self.speeds
+    /// 该通道最近一轮「最像在动」的目标：(类别, 幅度)。
+    /// 静止的模特、站岗的人幅度接近 0，事件录像据此不触发。
+    pub fn motion(&self, idx: usize) -> Option<(&'static str, f32, f32)> {
+        self.motions
             .get(&idx)
-            .filter(|(_, at)| at.elapsed() < std::time::Duration::from_secs(2))
-            .map(|(v, _)| *v)
-            .unwrap_or(0.0)
-    }
-
-    /// 最近的原始检测（类别, 分数），只看新鲜度不看阈值
-    pub fn raw_score(&self, idx: usize) -> Option<(&'static str, f32)> {
-        self.raw_max
-            .get(&idx)
-            .filter(|(_, _, at)| at.elapsed() < std::time::Duration::from_secs(2))
-            .map(|(score, label, _)| (*label, *score))
+            .filter(|(_, _, _, at)| at.elapsed() < std::time::Duration::from_secs(2))
+            .map(|(label, score, m, _)| (*label, *score, *m))
     }
 
     pub fn active(&self, idx: usize) -> Option<&Vec<Detection>> {

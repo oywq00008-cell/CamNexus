@@ -429,7 +429,7 @@ fn event_test(n: usize, cfg: &config::AppConfig) {
 
     let post = std::time::Duration::from_secs(cfg.event_post_secs.clamp(1, 60) as u64);
     for round in 1..=times {
-        tap.trigger(post);
+        tap.trigger(post, crate::eventrec::TriggerKind::Person);
         println!("第 {round} 次触发，等待 {} 秒收尾…", post.as_secs() + 3);
         std::thread::sleep(post + std::time::Duration::from_secs(4));
     }

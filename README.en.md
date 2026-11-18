@@ -83,7 +83,7 @@ The goal is simple: **turn an old PC into a surveillance recorder**. That's why 
 - **Person / vehicle detection** — draws boxes on the picture, but only around targets that are **moving**: a parked car or someone standing still will not keep a box.
   The toggle is remembered: after a restart — or a crash the watchdog recovers from — detection comes back the way you left it, so event recording keeps working.
   It needs a separate model download, runs on CPU or GPU, and samples at 1–25 FPS (10 on CPU, 25 on GPU) with an on-screen load estimate; it is heavy for older machines, so it stays off unless you turn it on.
-- **Boxes and triggers are not the same thing**: only moving targets get a box, but event recording is looser — a person counts while present (even standing still), while vehicles and bikes have to be moving.
+- **Boxes and triggers follow the same rule**: only moving targets get a box and only moving targets start a recording. A static mannequin, poster or guard does neither.
 
 ---
 
@@ -183,9 +183,10 @@ Files are organised as `channel / date / time`, and can be opened with any media
 The default is **24/7 continuous recording**. Settings → Recording → Recording mode also offers **on event**:
 
 - the camera stays connected, but the picture only lives in **memory** for the last few seconds (5 by default) and is never written to disk
-- two kinds of trigger: a **person** counts the moment they appear, even standing still; **vehicles and bikes** have to actually move (8% of the frame width per second). Detection boxes jitter by 1–2% on a parked car, so "record whatever is detected" would run all night
+- one trigger rule only: **something has to be moving**. A person walking (4% of the frame width per second) is enough; vehicles and bikes need more (8%/s)
+- **standing still records nothing** — a mannequin, a poster, a guard at his post never triggers it. Walk away or move, and recording resumes at once
 - the seconds around the trigger are saved, and two clips less than 30 seconds apart are joined into one file (adjustable, 0 disables joining)
-- one clip is capped at 10 minutes; it closes there rather than running forever because someone lingers
+- one clip is capped at 10 minutes. A **person**-triggered clip closes and immediately starts the next one, no gap; a **vehicle**-triggered clip then goes quiet for one cap length and waits for the vehicle to leave — otherwise a parked car would record all night
 - writing stops as soon as the trigger ends — the file handle stays open for a possible continuation, so the idle time never reaches the file
 - clips start on a keyframe, so the "5 seconds before" may run a little longer
 - detection must be enabled first; without it, event recording never triggers
@@ -282,7 +283,7 @@ Three options: switch to **event recording** so the disk is only written when so
 
 **Event recording is on, but nothing gets recorded.**
 
-Check three things in order: (1) is **detection** enabled under Settings → Experimental? Without it, event recording never triggers; (2) has the model finished downloading; (3) is the target too small — anything under 8% of the frame width is essentially invisible to a 640-input model, and lowering the display resolution makes distant targets bigger. Also note that **vehicles have to be moving**; a parked car does not trigger.
+Check four things in order: (1) is **detection** enabled under Settings → Experimental? Without it, event recording never triggers; (2) has the model finished downloading; (3) **is anything moving** — a mannequin or poster standing still never triggers it; (4) is the target too small — anything under 8% of the frame width is essentially invisible to a 640-input model, and lowering the display resolution makes distant targets bigger.
 
 **Why are event clips only ten-odd seconds long?**
 
@@ -292,9 +293,11 @@ Event recording keeps only the trigger window and stops writing the moment it en
 
 That clip was cut off when the app exited (shutdown, crash, task kill). The file is still there and plays up to the break, it just has no ending. If it happens often, check whether security software is terminating the process.
 
-**Why do boxes only appear on moving targets?**
+**Someone is in frame but nothing is being recorded.**
 
-Boxes and triggers are two different rules. Only **moving** targets get a box, so a parked car does not keep one forever; but event recording is looser — a person counts while present, even standing still. So "recording, but nobody is boxed" is normal.
+Because nothing is moving, and no movement means nothing is happening. Event recording only reacts to motion: a shop mannequin, a poster on the wall, a guard standing at his post — none of them trigger it. The moment they walk away, turn, or move, recording starts.
+
+If you want "record whenever anyone is present", that is effectively 24/7 — use continuous recording instead.
 
 **Which cameras are supported?**
 

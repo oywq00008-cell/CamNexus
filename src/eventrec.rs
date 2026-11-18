@@ -21,7 +21,7 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -75,9 +75,37 @@ impl Default for TapStatus {
     }
 }
 
+/// 触发者类别。只影响一件事：单段到上限后要不要静默。
+///
+/// 车能停一整晚，不静默就会录到天亮；人一直在动说明确实有事，
+/// 没有理由停下来，直接接着录下一段。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TriggerKind {
+    Person,
+    Vehicle,
+}
+
+/// 触发阈值（归一化宽度/秒）。
+///
+/// 人比车敏感一点：人走路本来就慢，而静止目标的抖动大约 1–2%/秒，4% 留了余量。
+/// 车辆必须动得更明显，否则停着的车框边缘抖一下就能触发。
+pub const PERSON_SPEED: f32 = 0.04;
+pub const VEHICLE_SPEED: f32 = 0.08;
+
+/// 该不该触发、以及这是人还是车。
+pub fn trigger_kind(person: bool, motion: f32) -> Option<TriggerKind> {
+    if person {
+        (motion >= PERSON_SPEED).then_some(TriggerKind::Person)
+    } else {
+        (motion >= VEHICLE_SPEED).then_some(TriggerKind::Vehicle)
+    }
+}
+
 pub struct Tap {
     /// 触发截止时刻（epoch 毫秒）；0 = 没触发。用原子量代替锁，热路径零竞争。
     trigger_ms: Arc<AtomicU64>,
+    /// 最近一次触发是谁引起的（0 = 人，1 = 车）
+    kind: Arc<AtomicU8>,
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<TapStatus>>,
 }
@@ -88,9 +116,10 @@ impl Tap {
     }
 
     /// 把触发窗口延长到 `now + post`。连续触发会不断续期。
-    pub fn trigger(&self, post: Duration) {
+    pub fn trigger(&self, post: Duration, kind: TriggerKind) {
         let until = epoch_ms() + post.as_millis() as u64;
         self.trigger_ms.fetch_max(until, Ordering::SeqCst);
+        self.kind.store(kind as u8, Ordering::SeqCst);
     }
 
     pub fn is_recording(&self) -> bool {
@@ -232,10 +261,13 @@ struct Engine {
     max_clip: Duration,
     /// 当前是否真的在往文件里写。续接窗口内文件是开着的，但不再写。
     writing: bool,
-    /// 达到上限后的静默截止时间：目标不离开也不再开新片段，
-    /// 但到一个上限时长后会重新武装——否则一个赖着不走的人
-    /// 会让这个通道从此再也不录。
+    /// 达到上限后的静默截止时间（**只对车生效**）。
+    ///
+    /// 车能停一整晚，不静默就会录到天亮；人不一样——一直在动说明确实有事，
+    /// 到上限就收尾、立刻接着录下一段。静默期满会自动重新武装。
     suppress_until: Option<Instant>,
+    /// 最近一次触发的来源，只用来决定单段到上限后要不要静默
+    kind: TriggerKind,
     /// 测试里关掉，避免真的起 ffmpeg
     remux: bool,
     /// 测试里关掉：否则单元测试会往用户的真实日志里写内容
@@ -263,6 +295,7 @@ impl Engine {
             max_clip,
             writing: false,
             suppress_until: None,
+            kind: TriggerKind::Vehicle,
             remux: true,
             log_enabled: true,
         }
@@ -358,11 +391,19 @@ impl Engine {
             if too_long {
                 if let Some(clip) = self.writer.take() {
                     let mins = self.max_clip.as_secs() / 60;
-                    self.log(&format!("{}（{mins} 分钟）", tr("单段已达上限，暂停直到目标离开")));
+                    let msg = if self.kind == TriggerKind::Vehicle {
+                        tr("单段已达上限，暂停直到车辆离开")
+                    } else {
+                        tr("单段已达上限，接着录下一段")
+                    };
+                    self.log(&format!("{}（{mins} 分钟）", msg));
                     self.finish(clip);
                 }
-                // 静默一个上限时长后重新武装
-                self.suppress_until = Some(now + self.max_clip.max(Duration::from_secs(60)));
+                // 只有车才静默：车能停一整晚，人一直在动说明确实有事。
+                // 人不停 → 下一帧数据到来就开新片段，前后靠环形缓冲接得上。
+                if self.kind == TriggerKind::Vehicle {
+                    self.suppress_until = Some(now + self.max_clip.max(Duration::from_secs(60)));
+                }
             }
             return;
         }
@@ -473,6 +514,7 @@ struct Ctx {
     spec: TapSpec,
     port: u16,
     trigger_ms: Arc<AtomicU64>,
+    kind: Arc<AtomicU8>,
     stop: Arc<AtomicBool>,
     status: Arc<Mutex<TapStatus>>,
 }
@@ -486,12 +528,14 @@ pub fn start(spec: TapSpec) -> Option<Tap> {
         spec,
         port,
         trigger_ms: Arc::new(AtomicU64::new(0)),
+        kind: Arc::new(AtomicU8::new(TriggerKind::Vehicle as u8)),
         stop: Arc::new(AtomicBool::new(false)),
         status: Arc::new(Mutex::new(TapStatus::default())),
     };
 
     let tap = Tap {
         trigger_ms: ctx.trigger_ms.clone(),
+        kind: ctx.kind.clone(),
         stop: ctx.stop.clone(),
         status: ctx.status.clone(),
     };
@@ -715,6 +759,11 @@ fn pump(
             },
         }
 
+        engine.kind = if ctx.kind.load(Ordering::SeqCst) == TriggerKind::Person as u8 {
+            TriggerKind::Person
+        } else {
+            TriggerKind::Vehicle
+        };
         engine.tick(active, Instant::now());
 
         if last_data.elapsed() > Duration::from_secs(STALL_SECS) {
@@ -994,6 +1043,38 @@ mod tests {
         assert!(r.drain().is_empty());
     }
 
+
+    /// 静止的人（模特、海报、站岗）不触发；动起来才算事件
+    #[test]
+    fn still_person_never_triggers() {
+        assert_eq!(trigger_kind(true, 0.0), None, "完全静止的人不能触发");
+        assert_eq!(trigger_kind(true, 0.02), None, "抖动不算动");
+        assert_eq!(
+            trigger_kind(true, PERSON_SPEED),
+            Some(TriggerKind::Person),
+            "走起来就该触发"
+        );
+        // 车比人迟钝：同样的速度，人算动、车不算
+        assert_eq!(trigger_kind(false, 0.05), None, "慢速车不触发");
+        assert_eq!(trigger_kind(false, VEHICLE_SPEED), Some(TriggerKind::Vehicle));
+    }
+
+    /// 人触发的单段到上限后要接着录，不能静默
+    #[test]
+    fn person_keeps_recording_past_max_clip() {
+        let dir = tmp_root("maxclip_person");
+        let mut e = engine_full(&dir, 5, Duration::from_secs(30), Duration::from_secs(1));
+        e.kind = TriggerKind::Person;
+        let t0 = Instant::now();
+        e.on_data(&[1u8; 8192], true, t0);
+
+        e.tick(true, t0 + Duration::from_millis(1100));
+        assert!(e.writer.is_none(), "到上限仍要收尾，文件不能无限长");
+        assert!(e.suppress_until.is_none(), "人触发的不该静默");
+
+        e.on_data(&[2u8; 8192], true, t0 + Duration::from_secs(2));
+        assert!(e.writer.is_some(), "应立刻开下一段，中间不停");
+    }
 
     #[test]
     fn max_clip_forces_stop_and_waits_for_target_to_leave() {

@@ -519,7 +519,8 @@ const SPEED_EPS: f32 = 0.03;
 /// 比画框的 3%/秒 严格得多：画框错一下只是多个框，触发错一下就是整段录像。
 /// 停着的摩托、被风吹的树，检测框边缘有 1~2% 的抖动，按 3% 判定会被当成
 /// 在动，一晚上能触发几十次。正常行走横穿视野约 10~15%/秒，取 8% 两者分得开。
-pub const TRIGGER_SPEED: f32 = 0.08;
+// 触发阈值不在这里：见 `eventrec::PERSON_SPEED` / `VEHICLE_SPEED`。
+// 画框用的 3%/s（SPEED_EPS）比触发松得多，两者别混。
 /// 判定「在动」的最小尺寸变化率（线性，每秒）。
 /// 朝着镜头走过来时中心点几乎不动，但框会持续变大，只看位移会漏掉。
 const SCALE_EPS: f32 = 0.08;
@@ -541,23 +542,31 @@ const MOVE_WINDOW: std::time::Duration = std::time::Duration::from_millis(400);
 /// 一旦移动立刻恢复。
 pub struct Tracker {
     tracks: Vec<Track>,
-    /// 本轮跟踪里最快的那条轨迹（归一化宽度/秒）。
-    /// 触发用它，而不是「有没有动」——判定阈值 3%/秒 对画框够用，
-    /// 但对触发太松：一辆停着的摩托，框边缘抖动就能越过它。
-    last_speed: f32,
+    /// 本轮最"像在动"的那条轨迹的类别与幅度（归一化宽度/秒）。
+    /// 幅度取「中心位移」与「尺寸变化率」的较大值：朝镜头走过来时中心几乎不动，
+    /// 只看位移会把人判成静止。
+    last_motion: f32,
+    last_label: &'static str,
+    /// 上面那条轨迹的置信度。触发要过置信度门槛，必须用**同一条**轨迹的分数：
+    /// 拿「全帧最高分」去卡，画面里同时有车和人时会串。
+    last_score: f32,
 }
 
 impl Tracker {
     pub fn new() -> Self {
         Self {
             tracks: Vec::new(),
-            last_speed: 0.0,
+            last_motion: 0.0,
+            last_label: "",
+            last_score: 0.0,
         }
     }
 
     /// 输入本帧检测结果，返回应当显示的目标
     pub fn update(&mut self, dets: &[Detection], now: Instant) -> Vec<Detection> {
-        self.last_speed = 0.0;
+        self.last_motion = 0.0;
+        self.last_label = "";
+        self.last_score = 0.0;
         let mut used = vec![false; self.tracks.len()];
 
         for d in dets {
@@ -599,7 +608,12 @@ impl Tracker {
                         let v = (t.smooth.0 - t.anchor.0).hypot(t.smooth.1 - t.anchor.1) / dt;
                         let scale_rate =
                             ((t.smooth_size / t.anchor_size.max(1e-6)) - 1.0).abs() / dt;
-                        self.last_speed = self.last_speed.max(v);
+                        let m = v.max(scale_rate);
+                        if m > self.last_motion {
+                            self.last_motion = m;
+                            self.last_label = t.label;
+                            self.last_score = t.score;
+                        }
                         if v > SPEED_EPS || scale_rate > SCALE_EPS {
                             t.moved_at = Some(now);
                         }
@@ -684,9 +698,16 @@ impl Trackers {
     }
 
     /// 按通道号更新，返回该通道应当显示的目标
-    /// 该通道最近一轮的最大运动速度（归一化宽度/秒）
-    pub fn speed(&self, idx: usize) -> f32 {
-        self.map.get(&idx).map(|(t, _)| t.last_speed).unwrap_or(0.0)
+    /// 该通道最近一轮「最像在动」的目标：(类别, 运动幅度)。
+    ///
+    /// 幅度是位移与尺寸变化率取大，朝镜头走也能算出来。
+    /// 事件录制的触发行数就靠它——静止的模特、站岗的人幅度接近 0。
+    pub fn motion(&self, idx: usize) -> Option<(&'static str, f32, f32)> {
+        let (t, _) = self.map.get(&idx)?;
+        if t.last_label.is_empty() {
+            return None;
+        }
+        Some((t.last_label, t.last_score, t.last_motion))
     }
 
     pub fn update(
