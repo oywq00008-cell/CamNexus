@@ -11,8 +11,8 @@
 1 ICON "assets\\camnexus.ico"
 
 1 VERSIONINFO
-FILEVERSION     0,6,0,0
-PRODUCTVERSION  0,6,0,0
+FILEVERSION     0,6,1,0
+PRODUCTVERSION  0,6,1,0
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          0x40004L
@@ -25,12 +25,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "oywq0008-cell"
             VALUE "FileDescription",  "CamNexus 监控中枢 — 局域网 RTSP 摄像统一监看"
-            VALUE "FileVersion",      "0.6.0"
+            VALUE "FileVersion",      "0.6.1"
             VALUE "InternalName",     "camnexus"
             VALUE "LegalCopyright",   "© 2026 oywq0008-cell"
             VALUE "OriginalFilename", "camnexus.exe"
             VALUE "ProductName",      "CamNexus 监控中枢"
-            VALUE "ProductVersion",   "0.6.0"
+            VALUE "ProductVersion",   "0.6.1"
             VALUE "Comments",         "支持任意 RTSP 设备统一监看、录像回放与人体/车辆识别"
         END
     END
