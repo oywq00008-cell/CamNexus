@@ -989,6 +989,42 @@ mod tests {
         assert!(lim < cap);
     }
 
+    /// 事件片段和全天录像共用同一个配额：目录在录像根下，遍历是递归的，
+    /// 所以「空间不足自动删最旧的」对事件录像同样生效。
+    #[test]
+    fn quota_also_prunes_event_clips() {
+        let dir = std::env::temp_dir().join(format!("camnexus_quota_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let day = dir.join("事件片段").join("2026-11-19").join("镜头1");
+        std::fs::create_dir_all(&day).unwrap();
+
+        // 三个 1 MB 的片段，mtime 依次变新
+        let now = std::time::SystemTime::now();
+        for (i, name) in ["a.mp4", "b.mp4", "c.mp4"].iter().enumerate() {
+            let p = day.join(name);
+            std::fs::write(&p, vec![0u8; 1024 * 1024]).unwrap();
+            let t = now - std::time::Duration::from_secs(300 - i as u64 * 100);
+            let f = std::fs::File::options().write(true).open(&p).unwrap();
+            f.set_modified(t).unwrap();
+        }
+
+        // 三个 1 MB、上限 2 MB → 删掉最旧的一个就正好降到线上
+        let stats = cleanup(&dir, 2, &[]).expect("应当触发清理");
+        assert_eq!(stats.0, 1, "删一个就够，不必多删");
+        assert!(!day.join("a.mp4").exists(), "最旧的最先被删");
+        assert!(day.join("b.mp4").exists(), "降到位就停手");
+        assert!(day.join("c.mp4").exists(), "最新的必须留着");
+
+        // 正在写的 .part.ts 不计入容量（不是 .mp4），删不到它
+        std::fs::write(day.join("d.part.ts"), vec![0u8; 4 * 1024 * 1024]).unwrap();
+        assert!(
+            cleanup(&dir, 2, &[]).is_none(),
+            "临时文件不该被算进配额"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn effective_limit_keeps_user_cap_when_disk_is_big() {
         // 盘很大 → 用户设的上限说了算
