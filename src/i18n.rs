@@ -100,6 +100,13 @@ pub fn audio_connecting(i: usize) -> String {
     }
 }
 
+pub fn audio_stalled(i: usize) -> String {
+    match lang() {
+        Lang::Zh => format!("音频 通道{}  无数据", i + 1),
+        Lang::En => format!("Audio ch{}  no data", i + 1),
+    }
+}
+
 pub fn audio_level(i: usize, pct: f32) -> String {
     match lang() {
         Lang::Zh => format!("音频 通道{}  电平 {pct:.0}%", i + 1),

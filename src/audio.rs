@@ -29,6 +29,11 @@ pub struct AudioBuf {
     pub got_data: Arc<AtomicBool>,
     /// 最近一块音频的 RMS（f32 的 bit 形式），用于电平显示
     pub level: Arc<AtomicU32>,
+    /// 最后一次收到数据的时刻（epoch 毫秒，0 = 从没收到过）。
+    ///
+    /// `got_data` 是粘性的：只要响过一次就永远为真，界面上会出现
+    /// 「显示在播、其实半小时没数据了」。只有时间戳能看出这件事。
+    last_at: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AudioBuf {
@@ -46,6 +51,8 @@ impl AudioBuf {
             }
         }
         self.got_data.store(true, Ordering::Relaxed);
+        self.last_at
+            .store(crate::eventrec::epoch_ms(), Ordering::Relaxed);
 
         let sum: f32 = samples
             .iter()
@@ -73,6 +80,7 @@ impl AudioBuf {
             g.clear();
         }
         self.got_data.store(false, Ordering::Relaxed);
+        self.last_at.store(0, Ordering::Relaxed);
         self.level.store(0f32.to_bits(), Ordering::Relaxed);
     }
 
@@ -82,6 +90,22 @@ impl AudioBuf {
 
     pub fn active(&self) -> bool {
         self.got_data.load(Ordering::Relaxed)
+    }
+
+    /// 距离上次收到数据过了多久；None = 从来没收到过（属于「连接中」）
+    pub fn idle(&self) -> Option<Duration> {
+        let last = self.last_at.load(Ordering::Relaxed);
+        if last == 0 {
+            return None;
+        }
+        Some(Duration::from_millis(
+            crate::eventrec::epoch_ms().saturating_sub(last),
+        ))
+    }
+
+    /// 在播但长时间没有数据
+    pub fn stalled(&self, limit: Duration) -> bool {
+        matches!(self.idle(), Some(d) if d > limit)
     }
 }
 
@@ -111,6 +135,11 @@ impl AudioPlayer {
 
     pub fn level(&self) -> f32 {
         self.buf.level()
+    }
+
+    /// 在播但长时间没收到数据
+    pub fn stalled(&self, limit: Duration) -> bool {
+        self.buf.stalled(limit)
     }
 
     /// 停止播放（不动 RTSP 连接）
@@ -208,6 +237,27 @@ mod tests {
         assert_eq!(b.take(3), vec![1, 2, 3]);
         assert_eq!(b.take(10), vec![4, 5]);
         assert!(b.take(1).is_empty());
+    }
+
+    /// 界面上的「无数据」提示靠这个判定：只有时间戳能看出「在播但其实没数据」，
+    /// `got_data` 是粘性的，响过一次就永远为真。
+    #[test]
+    fn stall_is_detected_from_last_push() {
+        let b = AudioBuf::default();
+        assert_eq!(b.idle(), None, "还没开始不算停滞");
+        assert!(!b.stalled(Duration::from_secs(5)));
+
+        b.push(&[1000i16; 480]);
+        assert!(b.idle().is_some());
+        assert!(!b.stalled(Duration::from_secs(5)), "刚推过数据不算停滞");
+
+        // 把时间戳拨到 9 秒前，模拟「播放器在跑、数据断了」
+        b.last_at
+            .store(crate::eventrec::epoch_ms().saturating_sub(9_000), Ordering::Relaxed);
+        assert!(b.stalled(Duration::from_secs(5)), "9 秒没数据应判停滞");
+
+        b.clear();
+        assert_eq!(b.idle(), None, "清空后回到「还没开始」");
     }
 
     #[test]

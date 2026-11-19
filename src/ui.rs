@@ -218,6 +218,8 @@ pub struct CamNexusApp {
     // ---- 音频 ----
     audio_player: Option<AudioPlayer>,
     audio_idx: Option<usize>,
+    /// 启动参数要求开声音，但音轨还没探测完：等结果出来再开
+    pending_audio: Option<usize>,
     volume: Arc<AtomicU32>,
     icons: VolumeIcons,
     /// 打开设置面板时的主题，用于「取消」时还原
@@ -1091,6 +1093,7 @@ impl CamNexusApp {
             hint_dismissed: false,
             audio_player: None,
             audio_idx: None,
+            pending_audio: None,
             icons: VolumeIcons::load(&cc.egui_ctx),
             open_dark: false,
             open_lang: crate::i18n::Lang::Zh,
@@ -1214,8 +1217,21 @@ impl CamNexusApp {
 
     /// 启动时自动播放指定通道的音频（--audio N，N 从 1 开始）
     pub fn start_audio_index(&mut self, idx: usize) {
-        if idx < self.cfg.channels.len() {
+        if idx >= self.cfg.channels.len() {
+            return;
+        }
+        // 这一刻音轨探测多半还没跑完（Stream 里的探测在取流线程里），
+        // 直接 toggle 会被判成「这一路没有音轨」。挂起，等探测有结果再开。
+        if self
+            .streams
+            .get(idx)
+            .and_then(|s| s.as_ref())
+            .map(|s| s.audio_available())
+            .unwrap_or(false)
+        {
             self.toggle_audio(idx);
+        } else {
+            self.pending_audio = Some(idx);
         }
     }
 
@@ -1407,8 +1423,16 @@ impl CamNexusApp {
             self.toast(tr("该通道未连接"));
             return;
         };
-        if !stream.audio_available() {
-            self.toast(tr("这一路没有音轨"));
+        let (available, downgraded) = (stream.audio_available(), stream.audio_downgraded());
+        if !available {
+            if downgraded {
+                // 不是没麦克风，是音频曾经把取流拖死、被临时关掉了。
+                // 重建这一路就会带着音频重新协商。
+                self.reconnect_one(idx);
+                self.toast(tr("正在重连以恢复音频，稍后再点一次喇叭"));
+            } else {
+                self.toast(tr("这一路没有音轨"));
+            }
             return;
         }
         let buf = stream.audio();
@@ -1758,6 +1782,11 @@ impl CamNexusApp {
                 if let Some(i) = self.audio_idx {
                     ui.add_space(10.0);
                     let (txt, color) = match self.audio_player.as_ref() {
+                        // 在播却半天没数据：说清楚是「没有音频数据」，
+                        // 别让人以为是自己音箱/音量的问题
+                        Some(a) if a.stalled(std::time::Duration::from_secs(5)) => {
+                            (i18n::audio_stalled(i), WARN)
+                        }
                         Some(a) if a.playing() => (
                             i18n::audio_level(i, (a.level() * 1000.0).clamp(0.0, 100.0)),
                             ACCENT,
@@ -2364,6 +2393,12 @@ impl CamNexusApp {
     fn reconnect_one(&mut self, idx: usize) {
         if idx >= self.streams.len() {
             return;
+        }
+        // 正在放这一路的声音：新 Stream 会换一个 AudioBuf，
+        // 播放器还攥着旧的，表现为「喇叭是开的、却永远没声」。
+        // 先停掉，让用户（或降级恢复流程）重新点一次。
+        if self.audio_idx == Some(idx) {
+            self.stop_audio();
         }
         // 先丢掉旧的：Drop 里会 kill + join 取流线程
         self.streams[idx] = None;
@@ -5509,6 +5544,22 @@ impl eframe::App for CamNexusApp {
                 egui::SystemTheme::Light
             }));
             ctx.request_repaint();
+        }
+
+        // 挂起的音频请求：音轨探测完成、这一路也在线了再真正打开
+        if let Some(i) = self.pending_audio {
+            let ready = self
+                .streams
+                .get(i)
+                .and_then(|s| s.as_ref())
+                .map(|s| s.audio_available())
+                .unwrap_or(false);
+            if ready {
+                self.pending_audio = None;
+                self.toggle_audio(i);
+            } else if self.streams.get(i).map(|s| s.is_none()).unwrap_or(true) {
+                self.pending_audio = None; // 这一路根本没起来，不用再等
+            }
         }
 
         let detect_err = if let Some(d) = self.detect.as_mut() {

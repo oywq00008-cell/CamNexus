@@ -134,7 +134,9 @@ impl Drop for Tap {
     }
 }
 
-fn epoch_ms() -> u64 {
+/// 当前 epoch 毫秒。时间戳类判断（触发截止、音频空闲）都用它，
+/// 免得各处各写一套、单位还容易搞混。
+pub fn epoch_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)

@@ -92,12 +92,20 @@ fn safe_tag(url: &str) -> String {
     }
 }
 
+/// 音频链路的共享句柄：缓冲、探测结果、降级标记。
+///
+/// 三者总是一起传给取流线程，散着传会让 `run_loop` 变成 8 个参数。
+#[derive(Clone)]
+struct AudioHandle {
+    buf: AudioBuf,
+    ok: Arc<AtomicBool>,
+    down: Arc<AtomicBool>,
+}
+
 pub struct Stream {
     shared: Arc<Mutex<Option<Frame>>>,
-    /// 音频缓冲（所有重连共用同一份，播放器不用跟着断）
-    audio: AudioBuf,
-    /// SDP 是否声明了音轨；探测失败或没有音轨时为 false
-    audio_ok: Arc<AtomicBool>,
+    /// 音频缓冲、探测结果、降级标记（所有重连共用同一份，播放器不用跟着断）
+    audio_h: AudioHandle,
     status: Arc<Mutex<Status>>,
     stop: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -114,6 +122,7 @@ impl Stream {
         let shared = Arc::new(Mutex::new(None));
         let audio = AudioBuf::default();
         let audio_ok = Arc::new(AtomicBool::new(false));
+        let audio_down = Arc::new(AtomicBool::new(false));
         let status = Arc::new(Mutex::new(Status::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
@@ -124,17 +133,21 @@ impl Stream {
             stop.clone(),
             child.clone(),
         );
-        let (au, aok) = (audio.clone(), audio_ok.clone());
+        let audio_h = AudioHandle {
+            buf: audio.clone(),
+            ok: audio_ok.clone(),
+            down: audio_down.clone(),
+        };
+        let ah = audio_h.clone();
         let c = cfg.clone();
         let thread = std::thread::Builder::new()
             .name(format!("stream {}", safe_tag(&cfg.url)))
-            .spawn(move || run_loop(c, s, st, sp, ch, au, aok))
+            .spawn(move || run_loop(c, s, st, sp, ch, ah))
             .ok();
 
         Self {
             shared,
-            audio,
-            audio_ok,
+            audio_h,
             status,
             stop,
             thread,
@@ -164,12 +177,18 @@ impl Stream {
 
     /// 音频缓冲：供播放器消费
     pub fn audio(&self) -> AudioBuf {
-        self.audio.clone()
+        self.audio_h.buf.clone()
     }
 
     /// 这条流是否真的带音轨（探测结果）
     pub fn audio_available(&self) -> bool {
-        self.audio_ok.load(Ordering::Relaxed)
+        self.audio_h.ok.load(Ordering::Relaxed)
+    }
+
+    /// 音频是不是「被临时关掉」的。跟「这台相机没有麦克风」要分开告诉用户：
+    /// 前者点一下声音就能重连恢复，后者重连也没用。
+    pub fn audio_downgraded(&self) -> bool {
+        self.audio_h.down.load(Ordering::Relaxed)
     }
 
     /// 取最新一帧（Arc 克隆，代价极低）
@@ -354,8 +373,7 @@ fn run_loop(
     status: Arc<Mutex<Status>>,
     stop: Arc<AtomicBool>,
     child_slot: Arc<Mutex<Option<Child>>>,
-    audio: AudioBuf,
-    audio_ok: Arc<AtomicBool>,
+    audio: AudioHandle,
 ) {
     let frame_len = (cfg.width as usize) * (cfg.height as usize) * 3;
 
@@ -367,7 +385,13 @@ fn run_loop(
     // 只探测一次：SDP 里有没有 m=audio。
     // 注意该型号的 SDP 里 m=audio 的端口字段恒为 0，不能拿端口判断可用性。
     let mut want_audio = cfg.audio && crate::discover::stream_has_audio(&cfg.url).unwrap_or(false);
-    audio_ok.store(want_audio, Ordering::Relaxed);
+    audio.ok.store(want_audio, Ordering::Relaxed);
+    // 下次允许重新探测音轨的时刻。
+    //
+    // 之前只在启动时探一次：一次偶发失败（相机正忙、DESCRIBE 超时）就会让
+    // 这一路「永远没声音」，只能手动重连。但也不能每次重连都探——相机断网时
+    // 探测会阻塞几秒，反而拖慢恢复。折中：正常 5 分钟一次，降级后 30 分钟一次。
+    let mut next_probe_at = Instant::now() + Duration::from_secs(300);
 
     let mut backoff: u64 = 1;
     let mut reconnects: u32 = 0;
@@ -376,6 +400,18 @@ fn run_loop(
     let mut seq: u64 = 0;
 
     while !stop.load(Ordering::SeqCst) {
+        // 音频关着、但用户要求有声音：重连时顺带再探一次。
+        // 之前只在启动时探一次，一次偶发失败（相机正忙、DESCRIBE 超时）
+        // 就会让这一路「永远没有声音」，直到手动重连或重启程序。
+        if !want_audio && cfg.audio && Instant::now() >= next_probe_at {
+            next_probe_at = Instant::now() + Duration::from_secs(300);
+            if crate::discover::stream_has_audio(&cfg.url).unwrap_or(false) {
+                want_audio = true;
+                audio.down.store(false, Ordering::Relaxed);
+                audio.ok.store(true, Ordering::Relaxed);
+            }
+        }
+
         // 其余地方都用 if let Ok：锁被毒化时宁可少更新一次状态，也不要 panic 掉整条取流线程
         if let Ok(mut s) = status.lock() {
             s.state = if reconnects == 0 {
@@ -422,7 +458,7 @@ fn run_loop(
 
         // 等 ffmpeg 连上来，持续把音频写进缓冲
         if let Some(l) = audio_listener {
-            let buf = audio.clone();
+            let buf = audio.buf.clone();
             let sp = stop.clone();
             let _ = std::thread::Builder::new()
                 .name("audio-read".into())
@@ -588,11 +624,19 @@ fn run_loop(
 
         // 带着音频却一帧都没出：多半是音轨把整条流拖死了。
         // 连续两次就关掉音频重连——宁可没声音，也不能没画面。
+        //
+        // 关键是「连续」：这个计数器原来只加不减，程序跑一晚上碰巧断两次
+        // 就会永久降级，之后再也不会尝试音频（用户看到的就是「开着声音却没声」）。
+        if got_any {
+            audio_fails = 0;
+        }
         if want_audio && !got_any {
             audio_fails += 1;
             if audio_fails >= 2 {
                 want_audio = false;
-                audio_ok.store(false, Ordering::Relaxed);
+                audio.ok.store(false, Ordering::Relaxed);
+                audio.down.store(true, Ordering::Relaxed);
+                next_probe_at = Instant::now() + Duration::from_secs(1800);
                 if let Ok(mut s) = status.lock() {
                     s.msg = tr("音频不可用，已切回纯画面").into();
                 }
